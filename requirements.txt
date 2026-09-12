@@ -1,0 +1,4 @@
+fastapi>=0.115,<0.142
+uvicorn[standard]>=0.30,<0.53
+aiohttp>=3.10,<3.15
+beautifulsoup4>=4.12,<4.15

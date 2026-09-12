@@ -1,0 +1,73 @@
+# Render Blueprint. Деплой: dashboard -> New -> Blueprint -> указать репозиторий
+# с этим файлом в корне. Или: render blueprints validate render.yaml && git push.
+#
+# ПОЧЕМУ ОДИН web-сервис, А НЕ web + отдельный worker.
+# service.py сам держит и цикл сборки, и FastAPI в одном процессе (см.
+# комментарий в service.py). Диск (см. ниже) можно приложить и к web,
+# и к background worker — но нам нужен именно web, потому что API должен
+# быть доступен снаружи по HTTP, а worker в Render порт наружу не отдаёт.
+#
+# ПОЧЕМУ НЕ free-план.
+# 1) Free-инстансы Render засыпают через 15 минут без входящего HTTP-
+#    трафика — а сборщику нужно работать по расписанию в фоне независимо
+#    от того, дёргает ли кто-то API прямо сейчас.
+# 2) Persistent disk вообще нельзя прикрепить к free-плану.
+#
+# ПРО ДИСК.
+# - Диск = один инстанс. Render прямо запрещает scale > 1 для сервиса
+#   с диском (numInstances здесь намеренно не указан — дефолт и так 1,
+#   но это тем более не переопределить). Устраивает: два процесса на
+#   одном SQLite-файле — гонка, не масштабирование.
+#   - Редеплой с диском НЕ zero-downtime: Render гасит старый инстанс,
+#   ждёт отсоединения диска, поднимает новый. Секунды простоя на каждый
+#   деплой — нормально для сервиса с расписанием в часах.
+# - Ежедневные снепшоты диска Render делает сам (хранит от 7 дней) —
+#   это тот бэкап "на всякий случай", который на Koyeb пришлось бы
+#   городить руками.
+
+services:
+  - type: web
+    runtime: docker
+    name: rieltor-collector
+    region: frankfurt          # ближайший к Казахстану из доступных Render-регионов
+    plan: 0.5c-512mb           # дешёвый платный план — минимум, к которому можно прицепить диск
+    numInstances: 1
+
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+
+    # Полный обход длится ~1.5 часа (DETAIL_CONCURRENCY=1 + пауза 1-2с на
+    # карточку — щадящий режим к krisha.kz, менять не стоит). Render при
+    # редеплое шлёт SIGTERM и добивает SIGKILL через maxShutdownDelaySeconds
+    # (максимум платформы — 300с). То есть обход в любом случае будет
+    # прерван на середине. Это безопасно: карточки коммитятся пачками по 10
+    # (DETAIL_FLUSH_EVERY), а прогресс обхода списка лежит в
+    # progress_list.json на диске — следующий запуск продолжит. Ставим
+    # максимум, чтобы дать дописать текущую пачку.
+    maxShutdownDelaySeconds: 300
+
+    disk:
+      name: rieltor-data
+      mountPath: /app/data     # совпадает с ENV в Dockerfile: KRISHA_DB, BASELINE_DIR
+      sizeGB: 1
+
+    envVars:
+      - key: KRISHA_DB
+        value: /app/data/krisha_astana.db
+      - key: BASELINE_DIR
+        value: /app/data/baseline_versions
+      - key: LOG_LEVEL
+        value: INFO
+      # Всё состояние (не только БД) — на диск. Без этого
+      # orchestrator_state.json, fast_known_ids.json, list_meta.json и
+      # progress_list.json писались бы в эфемерный /app и обнулялись на
+      # каждом редеплое. См. docstring paths.py.
+      - key: DATA_DIR
+        value: /app/data
+      # Render сам прокидывает PORT в контейнер; наш service.py слушает
+      # BASELINE_API_PORT. Явно синхронизируем оба на 8001, чтобы не
+      # зависеть от угадывания дефолтов Render.
+      - key: PORT
+        value: "8001"
+      - key: BASELINE_API_PORT
+        value: "8001"
