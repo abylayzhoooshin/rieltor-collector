@@ -1,0 +1,55 @@
+# ---- Данные и состояние ----
+# Ничего из этого в репозиторий попадать не должно: это runtime-состояние,
+# которое на проде живёт на persistent disk (DATA_DIR), а локально — рядом
+# с кодом. Закоммиченная krisha_astana.db весит десятки мегабайт и
+# конфликтует при каждом pull.
+data/
+baseline_versions/
+*.db
+*.db-wal
+*.db-shm
+
+# Состояние оркестратора и парсера (см. paths.py)
+orchestrator_state.json
+fast_known_ids.json
+list_meta.json
+progress_list.json
+progress_detail.json
+
+# Выгрузки и промежуточные CSV
+krisha_astana_ids.csv
+krisha_astana_detail.csv
+krisha_astana_baseline.csv
+fast_new_listings.csv
+*_before_dedup.csv
+*_dropped.csv
+
+# ВАЖНО: official_rent_index.json НЕ игнорируется — это конфигурация,
+# а не данные. Он должен ехать в репозиторий и в образ.
+
+# ---- Логи ----
+*.log
+run.log
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+
+# ---- IDE / ОС ----
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# ---- Секреты ----
+# На Render переменные задаются в дашборде/render.yaml, .env в репозиторий
+# класть нельзя ни при каких обстоятельствах.
+.env
+.env.*
+*.pem
+*.key
