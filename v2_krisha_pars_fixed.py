@@ -74,6 +74,23 @@ DETAIL_FLUSH_EVERY = 10
 # Ограничение на количество страниц списка для теста. None = без ограничения.
 MAX_PAGES = None
 
+# Возраст снимка списка (list_meta.json), после которого его больше не
+# считаем свежим для права помечать missing — см. run_detail_stage.
+#
+# БАГ, КОТОРЫЙ ЭТО ЧИНИТ: константа использовалась в run_detail_stage,
+# но никогда не была объявлена — NameError при каждом FULL SCAN,
+# начиная с той версии, где появилась проверка свежести снимка.
+# Обход падал на уровне 2 ПОСЛЕ того, как уровень 1 честно доходил до
+# конца (в логе видно: "Уровень 1 завершён ПОЛНОСТЬЮ" — 163/163
+# страницы, 3143 id), то есть терялась вся уже проделанная работа
+# уровня 1 на каждом цикле, а orchestrator.run_task ставил повтор
+# через 15 минут — и падал точно так же снова. Обход НИ РАЗУ не
+# доходил до карточек с момента, когда это было задеплоено.
+#
+# Значение — 1.5 интервала полного обхода (совпадает по духу с
+# MISSING_GRACE_SECONDS в master_db.py: один пропуск прощается).
+LIST_SNAPSHOT_MAX_AGE_S = float(os.environ.get("LIST_SNAPSHOT_MAX_AGE_S", str(9 * 3600)))
+
 # Пауза между запросами страниц списка (сек)
 DELAY_MIN = 2.0
 DELAY_MAX = 4.0
@@ -200,6 +217,23 @@ def parse_listing_page(html, page_num):
 
 
 def get_total_pages_from_html(html):
+    """Возвращает число страниц или None, если распознать не удалось.
+
+    РАНЬШЕ ЗДЕСЬ БЫЛ return 1 — И В except, И В КОНЦЕ ФУНКЦИИ, ЕСЛИ
+    ПАТТЕРН НЕ НАШЁЛСЯ ВООБЩЕ. Это тихая порча данных страшнее краша:
+    смена вёрстки, капча вместо списка или временный сбой на стороне
+    krisha выдают HTML без digitalData — и вместо явной ошибки функция
+    молча говорила "страница одна". run_list_stage считал обход
+    завершённым после первой же страницы, list_meta.json получал
+    complete=true, и всё, что не попало на страницу 1 (то есть
+    практически вся база), на следующем full scan уходило в missing.
+    Никакого WARNING, никакого исключения — только правдоподобный, но
+    неверный результат.
+
+    Теперь: None здесь — сигнал "не разобрал", и вызывающий код обязан
+    трактовать это так же, как недоступность первой страницы (см.
+    run_list_stage) — снимок помечается aborted, а не complete.
+    """
     soup = BeautifulSoup(html, "html.parser")
     for script in soup.find_all("script"):
         if script.string and "window.digitalData" in script.string:
@@ -207,10 +241,11 @@ def get_total_pages_from_html(html):
             if m:
                 try:
                     data = json.loads(m.group(1))
-                    return int(data.get("listing", {}).get("pagesCount", 1))
-                except Exception:
-                    pass
-    return 1
+                    pages = data.get("listing", {}).get("pagesCount")
+                    return int(pages) if pages else None
+                except (ValueError, TypeError, json.JSONDecodeError):
+                    return None
+    return None
 
 
 async def run_list_stage(session):
@@ -263,6 +298,19 @@ async def run_list_stage(session):
         return {}
 
     total_pages = get_total_pages_from_html(first_html)
+    if total_pages is None:
+        print("❌ Не удалось распознать число страниц из HTML "
+              "(смена вёрстки? капча? пустая страница?). Прерываю уровень 1.")
+        # Тот же принцип, что при недоступности первой страницы выше:
+        # снимок неполный, помечаем честно, а не притворяемся, что
+        # страница одна.
+        save_progress(LIST_META_FILE, {
+            "complete": False,
+            "aborted": True,
+            "reason": "не удалось распознать pagesCount из HTML",
+            "finished_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        })
+        return {}
     if MAX_PAGES:
         total_pages = min(total_pages, MAX_PAGES)
     print(f"✅ Всего страниц: {total_pages}")

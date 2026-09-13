@@ -313,12 +313,37 @@ def _upsert_sql():
     if _UPSERT_SQL is None:
         cols = DETAIL_FIELDNAMES
         placeholders = ", ".join("?" for _ in cols)
-        updates = ", ".join(
-            f"{c}=excluded.{c}" for c in cols if c not in ("id", "first_seen_at")
-        )
+
+        # ЗАЩИТА ОТ ЗАТИРАНИЯ ХОРОШИХ ДАННЫХ ПУСТЫМИ.
+        #
+        # is_complete() (фильтр перед вызовом upsert_full, см.
+        # _detail_worker в v2_krisha_pars_fixed.py) проверяет только
+        # price/rooms/square_m2. Если страница объявления частично не
+        # распарсилась — сбой не в структурном JSON с ценой, а где-то
+        # ещё (координаты, фото, описание, улица) — карточка всё равно
+        # считается "полной" и раньше слепо перезаписывала БД, включая
+        # затирание хороших исторических значений на NULL. Это тише
+        # обычного краша и опаснее: программа не падает, просто выдаёт
+        # правдоподобный, но деградировавший результат.
+        #
+        # Для большинства колонок теперь: новое значение побеждает,
+        # ТОЛЬКО если оно не NULL — иначе остаётся то, что было.
+        # last_seen_at и status — исключение: они обязаны отражать сам
+        # факт визита (объявление посетили сейчас, оно активно сейчас),
+        # даже если остальной парсинг вышел неполным.
+        always_fresh = {"last_seen_at", "status"}
+        updates = []
+        for c in cols:
+            if c in ("id", "first_seen_at"):
+                continue
+            if c in always_fresh:
+                updates.append(f"{c}=excluded.{c}")
+            else:
+                updates.append(f"{c}=COALESCE(excluded.{c}, listings.{c})")
+
         _UPSERT_SQL = (
             f"INSERT INTO listings ({', '.join(cols)}) VALUES ({placeholders}) "
-            f"ON CONFLICT(id) DO UPDATE SET {updates}, "
+            f"ON CONFLICT(id) DO UPDATE SET {', '.join(updates)}, "
             f"first_seen_at=COALESCE(listings.first_seen_at, excluded.first_seen_at)"
         )
     return _UPSERT_SQL
