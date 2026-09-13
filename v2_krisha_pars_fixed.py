@@ -247,6 +247,19 @@ async def run_list_stage(session):
     first_html = await fetch_url(session, FETCH_URL, params={"page": 1})
     if first_html is None:
         print("Не удалось получить даже первую страницу. Прерываю уровень 1.")
+        # ВАЖНО: помечаем снимок неполным. Раньше здесь был голый
+        # return {}, и list_meta.json оставался от ПРОШЛОГО успешного
+        # прогона с complete=true. Уровень 2 читал старый CSV (мог быть
+        # многодневной давности), считал снимок полным и: воскрешал
+        # снятые объявления как active, а всё появившееся на сайте за
+        # это время помечал missing. Одна минута недоступности сайта
+        # приводила к массовой порче базы, без единого WARNING.
+        save_progress(LIST_META_FILE, {
+            "complete": False,
+            "aborted": True,
+            "reason": "первая страница списка недоступна",
+            "finished_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        })
         return {}
 
     total_pages = get_total_pages_from_html(first_html)
@@ -323,10 +336,21 @@ async def run_list_stage(session):
 
 
 def _write_list_csv(rows_by_id):
-    with open(LIST_OUTPUT_CSV, "w", encoding="utf-8-sig", newline="") as f:
+    # Через .tmp + os.replace, как save_state/save_known_ids. Раньше был
+    # прямой open("w"), который усекает файл мгновенно: файл на 3000
+    # строк переписывается на каждой из ~150 страниц, и SIGKILL в этот
+    # момент оставлял CSV, обрезанный на случайной строке. Следующий
+    # запуск дочитывал оставшиеся страницы, skipped_pages оставался
+    # пустым, снимок объявлялся полным — и mark_missing выкашивал всё,
+    # что было в потерянном куске.
+    tmp = LIST_OUTPUT_CSV + ".tmp"
+    with open(tmp, "w", encoding="utf-8-sig", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=LIST_FIELDNAMES)
         writer.writeheader()
         writer.writerows(rows_by_id.values())
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, LIST_OUTPUT_CSV)
 
 
 # ============================== УРОВЕНЬ 2: КАРТОЧКА ==============================
@@ -596,6 +620,30 @@ async def run_detail_stage(session):
 
     list_meta = load_progress(LIST_META_FILE)
     list_scan_complete = bool(list_meta.get("complete"))
+
+    # Снимок списка должен быть не только полным, но и СВЕЖИМ. Файл
+    # лежит на диске и переживает рестарты, поэтому "complete: true"
+    # мог остаться от обхода недельной давности — а по нему нельзя
+    # решать, что пропало с сайта. Если снимок старый, карточки качаем
+    # как обычно, но права помечать missing не даём.
+    finished_at = list_meta.get("finished_at")
+    if list_scan_complete and finished_at:
+        try:
+            fin = datetime.fromisoformat(str(finished_at).replace("Z", "+00:00"))
+            if fin.tzinfo is None:
+                fin = fin.replace(tzinfo=timezone.utc)
+            age_s = (datetime.now(timezone.utc) - fin).total_seconds()
+            if age_s > LIST_SNAPSHOT_MAX_AGE_S:
+                print(f"⚠️  Снимок списка старше {LIST_SNAPSHOT_MAX_AGE_S / 3600:.0f}ч "
+                      f"({age_s / 3600:.1f}ч) — не помечаю пропавшие как missing.")
+                list_scan_complete = False
+        except ValueError:
+            print("⚠️  Не удалось разобрать finished_at в list_meta — "
+                  "не помечаю пропавшие как missing.")
+            list_scan_complete = False
+    elif list_scan_complete and not finished_at:
+        print("⚠️  В list_meta нет finished_at — не помечаю пропавшие как missing.")
+        list_scan_complete = False
 
     with master_db.connect() as conn:
         known = master_db.existing_ids(conn)

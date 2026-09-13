@@ -20,10 +20,18 @@ COPY . .
 # volume каталог всё равно создастся и будет работать, но исчезнет
 # при каждом рестарте контейнера — это ожидаемо для локальной отладки,
 # НЕ для прода.
+# DATA_DIR — корень ВСЕГО состояния (см. paths.py). Раньше его тут не
+# было, и вне render.yaml все восемь файлов состояния уезжали в
+# эфемерный /app.
+ENV DATA_DIR=/app/data
 ENV KRISHA_DB=/app/data/krisha_astana.db
 ENV BASELINE_DIR=/app/data/baseline_versions
 RUN mkdir -p /app/data
 
+# Без этого stdout в контейнере буферизуется блоками, и print() из
+# воркеров теряется целиком при SIGKILL — ровно тогда, когда логи и
+# нужны для разбора.
+ENV PYTHONUNBUFFERED=1
 ENV BASELINE_API_HOST=0.0.0.0
 ENV BASELINE_API_PORT=8001
 EXPOSE 8001

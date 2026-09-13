@@ -58,6 +58,13 @@ services:
         value: /app/data/baseline_versions
       - key: LOG_LEVEL
         value: INFO
+      # Токен для /baseline/*. generateValue: Render сгенерирует секрет
+      # сам при первом деплое и покажет в дашборде — в репозиторий он не
+      # попадёт. Без этой переменной проверка токена ВЫКЛЮЧЕНА, и весь
+      # собранный датасет качается по прямой ссылке кем угодно.
+      # /health токена не требует, иначе Render не сможет проверять сервис.
+      - key: BASELINE_API_KEY
+        generateValue: true
       # Всё состояние (не только БД) — на диск. Без этого
       # orchestrator_state.json, fast_known_ids.json, list_meta.json и
       # progress_list.json писались бы в эфемерный /app и обнулялись на

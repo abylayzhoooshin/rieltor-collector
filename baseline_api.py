@@ -13,15 +13,47 @@ FastAPI-сервис поверх baseline_versions/, который собир�
 """
 import json
 import os
+import secrets
 import sqlite3
 
-from fastapi import FastAPI, HTTPException, Query
+import paths
+from datetime import datetime, timezone
+
+from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from fastapi.responses import JSONResponse
 
-BASELINE_DIR = os.environ.get("BASELINE_DIR", "baseline_versions")
+BASELINE_DIR = paths.baseline_dir()
 LATEST_POINTER = os.path.join(BASELINE_DIR, "latest.json")
 
+# Токен доступа. Пусто => проверка выключена (локальная отладка).
+# В проде задаётся переменной окружения; без него весь собранный
+# датасет — включая описания и ссылки на фотографии — качается одним
+# curl любым желающим.
+API_KEY = os.environ.get("BASELINE_API_KEY", "").strip()
+
+# Потолок выдачи. Раньше limit=0 означал «вся таблица»: ~3000 строк с
+# full_description и photo_urls живут в памяти одновременно как
+# sqlite3.Row, как dict и как сериализованный JSON — десятки мегабайт
+# пикового RSS на ОДИН запрос при лимите инстанса 512 МБ. Несколько
+# параллельных запросов означали OOM и перезапуск сервиса.
+MAX_PAGE_SIZE = 500
+DEFAULT_PAGE_SIZE = 100
+
+# Возраст, после которого baseline считается протухшим и /health отдаёт
+# 503. По умолчанию — два интервала полного обхода (6ч), то есть один
+# пропущенный цикл ещё нормально, два подряд уже нет.
+STALE_AFTER_SECONDS = int(os.environ.get("BASELINE_STALE_AFTER_S", str(2 * 6 * 3600)))
+
 app = FastAPI(title="rieltor-baseline")
+
+
+def require_api_key(x_api_key: str = Header(default="")):
+    """Проверка токена. compare_digest, чтобы сравнение не зависело от
+    того, на каком символе строки разошлись."""
+    if not API_KEY:
+        return
+    if not secrets.compare_digest(x_api_key, API_KEY):
+        raise HTTPException(status_code=401, detail="неверный или отсутствующий X-API-Key")
 
 
 def _read_pointer():
@@ -50,7 +82,7 @@ def _open_version(pointer):
     return conn
 
 
-@app.get("/baseline/meta")
+@app.get("/baseline/meta", dependencies=[Depends(require_api_key)])
 def meta():
     pointer = _read_pointer()
     if pointer is None:
@@ -63,26 +95,38 @@ def meta():
         conn.close()
 
 
-@app.get("/baseline/table")
-def table(limit: int = Query(0, ge=0, description="0 = без ограничения"),
+@app.get("/baseline/table", dependencies=[Depends(require_api_key)])
+def table(limit: int = Query(DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE),
           offset: int = Query(0, ge=0)):
+    """Страница строк baseline.
+
+    limit обязателен и ограничен сверху: полную таблицу забирают
+    постраничным обходом, ориентируясь на row_count из /baseline/meta.
+    Версия возвращается в каждом ответе — если она сменилась посреди
+    обхода, страницы относятся к разным наборам данных, и обход нужно
+    начать заново.
+    """
     pointer = _read_pointer()
     if pointer is None:
         raise HTTPException(status_code=503, detail="baseline ещё не собран")
     conn = _open_version(pointer)
     try:
-        sql = "SELECT * FROM baseline"
-        params = []
-        if limit:
-            sql += " LIMIT ? OFFSET ?"
-            params = [limit, offset]
-        rows = [dict(r) for r in conn.execute(sql, params)]
-        return {"version": pointer["version"], "row_count": len(rows), "rows": rows}
+        total = conn.execute("SELECT COUNT(*) FROM baseline").fetchone()[0]
+        rows = [dict(r) for r in conn.execute(
+            "SELECT * FROM baseline LIMIT ? OFFSET ?", (limit, offset))]
+        return {
+            "version": pointer["version"],
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "returned": len(rows),
+            "rows": rows,
+        }
     finally:
         conn.close()
 
 
-@app.get("/price-index")
+@app.get("/price-index", dependencies=[Depends(require_api_key)])
 def price_index_endpoint():
     """Индекс цен той версии, что сейчас опубликована.
 
@@ -113,5 +157,44 @@ def price_index_endpoint():
 
 @app.get("/health")
 def health():
+    """Healthcheck для платформы. Без токена — иначе Render не сможет
+    проверять сервис.
+
+    Возвращает не-200, когда baseline непригоден: раньше здесь всегда
+    было 200, включая случаи «baseline не собран» и «baseline недельной
+    давности». Render перезапускает сервис только по не-2xx, то есть
+    healthcheck не ловил ни одного реального сбоя — а именно тихое
+    устаревание и есть главный режим отказа этого сервиса: сборщик
+    умирает, API продолжает бодро отдавать всё более старые данные.
+    """
     pointer = _read_pointer()
-    return {"baseline_ready": pointer is not None, "version": pointer["version"] if pointer else None}
+    if pointer is None:
+        return JSONResponse(
+            {"status": "starting", "baseline_ready": False,
+             "detail": "baseline ещё не собран"},
+            status_code=503,
+        )
+
+    age = None
+    built_at = pointer.get("built_at")
+    if built_at:
+        try:
+            dt = datetime.fromisoformat(str(built_at).replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            age = (datetime.now(timezone.utc) - dt).total_seconds()
+        except ValueError:
+            age = None
+
+    stale = age is not None and age > STALE_AFTER_SECONDS
+    body = {
+        "status": "stale" if stale else "ok",
+        "baseline_ready": True,
+        "version": pointer["version"],
+        "row_count": pointer.get("row_count"),
+        "built_at": built_at,
+        "age_seconds": int(age) if age is not None else None,
+    }
+    # 503 при устаревании: платформа перезапустит сервис, а перезапуск
+    # запускает полный обход, то есть это ещё и попытка самолечения.
+    return JSONResponse(body, status_code=503 if stale else 200)

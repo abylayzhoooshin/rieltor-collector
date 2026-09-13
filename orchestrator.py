@@ -70,7 +70,28 @@ FULL_SCAN_INTERVAL_H = 6.0
 
 # Как часто крутить окно первых страниц. Тут запросов мало
 # (FAST_LIST_MAX_PAGES страниц + карточки только реально новых id).
-FAST_INTERVAL_MIN = 5.0
+FAST_INTERVAL_MIN = float(os.environ.get("FAST_INTERVAL_MIN", "60"))
+# Раз в час, а не раз в 5 минут.
+#
+# ПОЧЕМУ СНИЖЕНО. Пятиминутный интервал давал 288 прогонов в сутки
+# против 4 у полного обхода, то есть ~70% всей нагрузки на krisha.kz
+# приходилось на fast track. Бан по IP уже случался (см. комментарий о
+# снижении параллелизма ниже), а единственный потребитель результата —
+# бот-уведомитель — ещё не написан, так что эта нагрузка пока не
+# окупается ничем.
+#
+# ПОЧЕМУ ЧАС БЕЗОПАСЕН. Окно fast track — 5 страниц по ~20 карточек,
+# то есть около 100 объявлений. Замер по created_at за две недели:
+# в среднем 144 новых объявления в сутки (6/час), пик 231 (9.6/час).
+# Запас примерно десятикратный — за час окно не переполнится даже в
+# самый активный день, и ни одно новое объявление не проскочит мимо.
+#
+# Если поток вырастет (сезон, расширение на другие города), поднимать
+# нужно не частоту, а FAST_LIST_MAX_PAGES: окно дешевле частоты.
+
+# Как часто пересобирать baseline. Не привязано к обходу: данные в
+# master_db есть всегда, а обход может быть прерван рестартом.
+BASELINE_BUILD_INTERVAL_MIN = float(os.environ.get("BASELINE_BUILD_INTERVAL_MIN", "30"))
 
 # Запускать ли fast track вообще. Базу целиком собирает full scan; fast
 # track нужен, только если хочется ловить новые объявления в течение
@@ -163,24 +184,12 @@ async def run_full_scan(session):
         log(f"💾 База выгружена в {path}")
     log(f"⏹  FULL SCAN завершён за {human(time.time() - started)}")
 
-    # Пересборка baseline — после КАЖДОГО full scan, не после fast track:
-    # дедуп (clean_baseline_dupes) всё равно требует полного снапшота, а
-    # fast track видит только первые FAST_LIST_MAX_PAGES страниц — гонять
-    # build_baseline после него означало бы дедупить неполные данные.
-    #
-    # to_thread: build_baseline.build() синхронный (sqlite3, без await) и
-    # на нескольких тысячах строк занимает секунды — без to_thread он
-    # застопорил бы event loop, в котором тем временем должен бы крутиться
-    # и fast track (если бы оркестратор был устроен параллельно; сейчас
-    # цикл последовательный, но to_thread не помешает и дешёвый).
-    log("🧱 Пересборка baseline...")
-    try:
-        version, rows = await asyncio.to_thread(build_baseline.build)
-        log(f"✅ baseline version={version}, rows={rows}")
-    except Exception:
-        log(f"❌ Пересборка baseline упала:\n{traceback.format_exc()}")
-        log("   Старая версия baseline (если была) остаётся опубликованной — "
-            "latest.json не тронут.")
+
+async def run_build_baseline(session=None):
+    """Пересборка и публикация baseline. session не используется —
+    параметр есть ради единой сигнатуры run_task."""
+    version, rows = await asyncio.to_thread(build_baseline.build)
+    log(f"✅ baseline version={version}, rows={rows}")
 
 
 async def run_fast_track(session):
@@ -219,9 +228,24 @@ class Orchestrator:
         save_state(self.state)
 
     async def run_task(self, name, key, interval_s, coro_factory, session):
+        # Расписание пишется ДО запуска задачи, а не после успешного
+        # возврата. Раньше schedule() стоял после await: если процесс
+        # убивали посреди полуторачасового обхода (редеплой, OOM,
+        # SIGKILL от платформы), ключ в состоянии не обновлялся, и после
+        # рестарта due() сразу давал True — обход начинался заново.
+        # При рестартах чаще, чем длится обход, он не завершался НИКОГДА,
+        # а значит build_baseline (он в хвосте обхода) не вызывался тоже,
+        # и API молча отдавал всё более старую версию.
+        #
+        # Цена смены порядка: при падении задачи цикл будет пропущен, а
+        # не повторён немедленно. Для сбора это верный размен — лишний
+        # пропущенный обход дешевле бесконечного цикла перезапусков,
+        # добивающего и сайт, и инстанс.
+        self.schedule(key, interval_s)
+        self.state["last_started_" + key] = time.time()
+        save_state(self.state)
         try:
             await coro_factory(session)
-            self.schedule(key, interval_s)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -232,6 +256,7 @@ class Orchestrator:
     async def loop(self):
         full_interval = FULL_SCAN_INTERVAL_H * 3600
         fast_interval = FAST_INTERVAL_MIN * 60
+        build_interval = BASELINE_BUILD_INTERVAL_MIN * 60
 
         # Одна сессия на весь процесс: keep-alive и один набор cookie
         # выглядят для сайта естественнее, чем новое соединение каждые
@@ -279,6 +304,21 @@ class Orchestrator:
                     await asyncio.sleep(COOLDOWN_BETWEEN_RUNS_S)
                     continue
 
+                # Пересборка baseline — СВОЯ задача, а не хвост обхода.
+                # Раньше build_baseline вызывался только в конце
+                # run_full_scan: прерванный обход означал, что новая
+                # версия не публикуется вообще, хотя данные в master_db
+                # уже лежат и пригодны. Теперь публикация зависит только
+                # от содержимого базы, а не от того, доехал ли скрейп до
+                # конца.
+                if self.due("next_build", build_interval):
+                    await self.run_task(
+                        "BUILD BASELINE", "next_build", build_interval,
+                        run_build_baseline, session,
+                    )
+                    await asyncio.sleep(COOLDOWN_BETWEEN_RUNS_S)
+                    continue
+
                 if ENABLE_FAST_TRACK and self.due("next_fast", fast_interval):
                     await self.run_task(
                         "FAST TRACK", "next_fast", fast_interval, run_fast_track, session
@@ -288,7 +328,8 @@ class Orchestrator:
 
                 # Ничего не пора — спим короткими отрезками, чтобы сигнал
                 # остановки не ждал часами.
-                waits = [self.state.get("next_full", 0) - time.time()]
+                waits = [self.state.get("next_full", 0) - time.time(),
+                         self.state.get("next_build", 0) - time.time()]
                 if ENABLE_FAST_TRACK:
                     waits.append(self.state.get("next_fast", 0) - time.time())
                 await asyncio.sleep(min(30.0, max(1.0, min(waits))))

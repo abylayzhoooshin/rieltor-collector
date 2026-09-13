@@ -144,24 +144,61 @@ def make_blocks(rows):
     return blocks
 
 
-def candidate_pairs(blocks, max_block=60):
-    """Пары из блоков. Слишком большие блоки пропускаем — не информативны
-    (напр. весь крупный ЖК) и дают квадратичный взрыв."""
+def candidate_pairs(blocks, rows, max_block=60):
+    """Пары из блоков.
+
+    Слишком большой блок раньше выбрасывался целиком — и это ломалось
+    обвально, а не плавно: блок из 60 элементов давал 1770 пар и 59
+    удалённых дублей, блок из 61 давал ноль. Хуже того, в крупном ЖК
+    порог превышают ВСЕ ключи блокинга одновременно (geo4, geo3sq,
+    cx_sq, cx_rm), то есть дедуп выключался ровно там, где дублей
+    больше всего.
+
+    Теперь большой блок дробится более сильным ключом
+    (комнатность + округлённая площадь + этаж). Пара, разнесённая
+    дроблением по разным подблокам, всё равно не прошла бы decide():
+    там комнатность обязана совпадать, площадь — быть близкой, этаж —
+    совпадать. Так что дробление не теряет кандидатов, а только
+    ограничивает квадратичный рост.
+    """
     seen = set()
     skipped = 0
-    for key, idxs in blocks.items():
-        if len(idxs) < 2:
-            continue
-        if len(idxs) > max_block:
-            skipped += 1
-            continue
+    skipped_rows = 0
+
+    def _refine_key(i):
+        r = rows[i]
+        sq = round(r["_sq"]) if r["_sq"] else None
+        return (r["_rooms"], sq, r["_floor"])
+
+    def _emit(idxs):
         for a in range(len(idxs)):
             for b in range(a + 1, len(idxs)):
                 i, j = idxs[a], idxs[b]
                 if i > j:
                     i, j = j, i
                 seen.add((i, j))
-    return seen, skipped
+
+    for key, idxs in blocks.items():
+        if len(idxs) < 2:
+            continue
+        if len(idxs) <= max_block:
+            _emit(idxs)
+            continue
+
+        sub = defaultdict(list)
+        for i in idxs:
+            sub[_refine_key(i)].append(i)
+        for part in sub.values():
+            if 2 <= len(part) <= max_block:
+                _emit(part)
+            elif len(part) > max_block:
+                # Даже после дробления слишком много — это уже почти
+                # наверняка одинаковые студии в одном стояке. Считаем и
+                # сообщаем, а не молчим.
+                skipped += 1
+                skipped_rows += len(part)
+
+    return seen, skipped, skipped_rows
 
 
 # ---------------------------- house_num ----------------------------
@@ -188,7 +225,12 @@ def house_conflict(a, b):
 # ---------------------------- признаки ----------------------------
 
 def same_building(a, b):
-    if not (a["_lat"] and b["_lat"]):
+    # Проверяем ОБЕ координаты у ОБЕИХ строк. Раньше проверялась только
+    # широта, а haversine_m читал и долготу — карточка с lat без lon
+    # (усечённый JSON, смена вёрстки) роняла весь дедуп с TypeError, и
+    # сборка baseline падала на каждом прогоне, пока объявление не
+    # снимут с сайта. При этом /health продолжал отвечать ready=true.
+    if not (a["_lat"] and a["_lon"] and b["_lat"] and b["_lon"]):
         return False
     return haversine_m(a["_lat"], a["_lon"], b["_lat"], b["_lon"]) <= GEO_SAME_BUILDING_M
 
@@ -201,14 +243,23 @@ def area_close(a, b):
 
 
 def rooms_ok(a, b):
+    """Комнатность должна СОВПАДАТЬ, если заполнена у обеих строк.
+
+    Раньше допускалась разница в одну комнату. Защищать это нечем:
+    rooms приходит структурным полем из window.data, а не распознаётся
+    из текста, поэтому опечатка почти невозможна — зато соседние 1к и
+    2к на одном этаже одного дома встречаются постоянно. Прогон на
+    шаблонном описании новостройки показывал, что 1к 58 м² и 2к 62 м²
+    схлопывались в один объект (площади проходили по допуску 8%,
+    тексты совпадали на 0.93).
+    """
     if not (a["_rooms"] and b["_rooms"]):
+        return True  # неизвестно — не улика ни за, ни против
+    da = re.sub(r"\D", "", a["_rooms"])
+    db = re.sub(r"\D", "", b["_rooms"])
+    if not da or not db:
         return True
-    try:
-        d = abs(int(re.sub(r"\D", "", a["_rooms"]) or 0)
-                - int(re.sub(r"\D", "", b["_rooms"]) or 0))
-    except ValueError:
-        return True
-    return d <= 1
+    return da == db
 
 
 def same_floor(a, b):
@@ -217,17 +268,30 @@ def same_floor(a, b):
     return a["_floor"] == b["_floor"]
 
 
-def text_sim(a, b):
-    sa, sb = a["_shingles"], b["_shingles"]
-    if len(sa) < 8 or len(sb) < 8:
-        return None  # текста мало — улик нет
-    return len(sa & sb) / len(sa | sb)
+def area_very_close(a, b):
+    """Более жёсткий допуск площади, чем area_close: max(2 м², 4%).
+
+    Нужен там, где уликой служит цена. Разные квартиры в пуле агентства
+    почти всегда различаются площадью заметно; совпадение площади с
+    точностью до метра — само по себе сильный признак одного объекта.
+    """
+    if not (a["_sq"] and b["_sq"]):
+        return False
+    lo = min(a["_sq"], b["_sq"])
+    return abs(a["_sq"] - b["_sq"]) <= max(2.0, 0.04 * lo)
 
 
 def price_close(a, b, tol=0.02):
     if not (a["_price"] and b["_price"]):
         return False
     return abs(a["_price"] - b["_price"]) / max(a["_price"], b["_price"]) <= tol
+
+
+def text_sim(a, b):
+    sa, sb = a["_shingles"], b["_shingles"]
+    if len(sa) < 8 or len(sb) < 8:
+        return None  # текста мало — улик нет
+    return len(sa & sb) / len(sa | sb)
 
 
 # ---------------------------- решение ----------------------------
@@ -250,12 +314,20 @@ def decide(a, b, text_th=0.35):
 
     # --- трек A: подтверждённый один владелец ---
     # Одного владельца НЕДОСТАТОЧНО: риелтор ведёт много разных квартир в
-    # одном доме. Нужен ещё признак ОДНОГО решения: тот же этаж.
-    # Совпадение цены как альтернатива этажу намеренно не используется:
-    # агентство может ставить единый прайс на пул РАЗНЫХ квартир.
+    # одном доме. Нужен ещё признак ОДНОГО решения: тот же этаж И почти
+    # та же площадь.
+    #
+    # Площадь добавлена после разбора реальной склейки: под именем
+    # «ASTANA ELITE» (агентство, а не человек — в GENERIC_OWNERS такие
+    # не ловятся) схлопнулись 4к 160 м² за 700000 и 4к 170 м² за 800000
+    # на одном этаже. Это две разные квартиры из пула одного агентства,
+    # то есть ровно тот сценарий, ради которого цена не принимается как
+    # улика. Этаж один потому, что на этаже бывает несколько квартир.
     if named:
+        if fl is True and area_very_close(a, b):
+            return True, "A", f"владелец {a['_owner'][:18]}, этаж и площадь"
         if fl is True:
-            return True, "A", f"владелец {a['_owner'][:18]}, тот же этаж"
+            return False, None, "один владелец и этаж, но площади разные"
         return False, None, "один владелец, но этажи разные"
 
     # --- трек B: аноним ("Хозяин"), нужен тот же этаж + подтверждение ---
@@ -265,8 +337,24 @@ def decide(a, b, text_th=0.35):
     ts = text_sim(a, b)
     if ts is not None and ts >= text_th:
         return True, "B", f"текст {ts:.2f}"
-    if price_close(a, b) and fl is True:
-        return True, "B", "цена совпала, тот же этаж"
+
+    # Цена как улика — ТОЛЬКО в связке с жёстким совпадением площади.
+    #
+    # Возражение против цены звучит так: агентство ставит единый прайс
+    # на пул РАЗНЫХ квартир, поэтому совпадение цены ничего не доказывает.
+    # Возражение верное, но оно бьёт по цене В ОДИНОЧКУ. Разные квартиры
+    # в одном пуле различаются площадью: совпадение и цены, и площади до
+    # метра, и этажа, и дома — это уже не пул, это один объект.
+    #
+    # Проверено на данных: без этой улики дедуп теряет 65 из 68 склеек,
+    # и среди потерянных — очевидные дубли вида «2к 58 м² 450000 vs
+    # 2к 57 м² 450000, тот же этаж, тот же дом». Просто выкинуть улику
+    # было бы хуже, чем оставить её как была.
+    #
+    # Комнатность здесь уже проверена строго (rooms_ok выше), что и было
+    # главной дырой старого варианта.
+    if price_close(a, b) and fl is True and area_very_close(a, b):
+        return True, "B", "цена+площадь совпали, тот же этаж"
 
     return False, None, "нет подтверждения"
 
@@ -315,7 +403,7 @@ def dedupe_rows(rows, text_threshold=0.35, max_block=60):
     prepare(work)
 
     blocks = make_blocks(work)
-    pairs, _ = candidate_pairs(blocks, max_block=max_block)
+    pairs, skipped_blocks, skipped_rows = candidate_pairs(blocks, work, max_block=max_block)
 
     hits = []
     for i, j in pairs:
@@ -344,6 +432,12 @@ def dedupe_rows(rows, text_threshold=0.35, max_block=60):
         "candidate_pairs": len(pairs),
         "groups": len(clusters),
         "dropped": len(drop),
+        # Сколько кандидатов так и не рассмотрено. Раньше счётчик
+        # вычислялся и выбрасывался (pairs, _ = ...), поэтому по логу
+        # нельзя было отличить «дублей нет» от «половина города не
+        # рассматривалась».
+        "skipped_blocks": skipped_blocks,
+        "skipped_rows": skipped_rows,
     }
     return kept, stats
 

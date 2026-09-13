@@ -38,6 +38,18 @@ import os
 DATA_DIR = os.environ.get("DATA_DIR", ".")
 
 
+def baseline_dir():
+    """Каталог версий baseline.
+
+    Определён здесь, а не независимо в build_baseline и baseline_api:
+    раньше оба модуля имели СВОЙ дефолт "baseline_versions" —
+    относительный путь. Спасало только то, что render.yaml задаёт
+    переменную явно; тот же образ где угодно ещё писал бы версии в
+    эфемерный /app, и API искал бы их там же.
+    """
+    return os.environ.get("BASELINE_DIR") or data_path("baseline_versions")
+
+
 def data_path(filename):
     """Путь к файлу состояния внутри DATA_DIR.
 

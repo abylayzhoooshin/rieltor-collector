@@ -37,10 +37,15 @@ import csv
 import os
 import sqlite3
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import paths
 
 DB_PATH = os.environ.get("KRISHA_DB") or paths.data_path("krisha_astana.db")
+
+# Сколько объявление может не появляться в обходах, прежде чем будет
+# помечено missing. По умолчанию 1.5 интервала полного обхода (6ч) —
+# один пропуск прощается, два подряд уже нет. См. mark_missing.
+MISSING_GRACE_SECONDS = float(os.environ.get("MISSING_GRACE_S", str(9 * 3600)))
 
 # Имя CSV осталось прежним, но теперь это не хранилище, а точка
 # ВЫГРУЗКИ/ЗАГРУЗКИ (export_csv/import_csv). Если оркестратор или скрипты
@@ -390,6 +395,10 @@ def record_price_changes(conn, price_by_id, now=None):
         placeholders = ",".join("?" for _ in chunk)
         known = dict(conn.execute(
             f"SELECT id, price FROM listings WHERE id IN ({placeholders})", chunk))
+        # Дата последнего наблюдения — чтобы стартовая точка ряда несла
+        # honest-время, а не время миграции.
+        last_seen = dict(conn.execute(
+            f"SELECT id, last_seen_at FROM listings WHERE id IN ({placeholders})", chunk))
         # У кого уже есть хоть одна запись в истории — тот не новый.
         seeded = {r[0] for r in conn.execute(
             f"SELECT DISTINCT id FROM price_history WHERE id IN ({placeholders})", chunk)}
@@ -403,10 +412,22 @@ def record_price_changes(conn, price_by_id, now=None):
                 # Пишем стартовую точку ряда.
                 changes.append((rid, new, now))
             elif rid not in seeded:
-                # Есть в listings, но ряд ещё не начат (миграция со старой
-                # схемы). Фиксируем известную цену как начало ряда, а если
-                # она ещё и изменилась — изменение ляжет следующим обходом.
-                changes.append((rid, float(old), now))
+                # Ряд ещё не начат (строка пришла из сидирования или из
+                # старой схемы без price_history). Пишем ДВЕ точки:
+                # старую цену её собственной датой и новую — текущей.
+                #
+                # Раньше здесь писалась только старая цена, с
+                # комментарием «изменение ляжет следующим обходом».
+                # Не ложилось: listings.price тут же перезаписывался на
+                # новую, на следующем обходе old == new, а rid уже был в
+                # seeded — ветка изменения не срабатывала, и новая цена
+                # не попадала в историю никогда. Плюс августовская цена
+                # получала сегодняшнюю дату, то есть ряд ещё и врал о
+                # времени.
+                old_at = last_seen.get(rid) or now
+                changes.append((rid, float(old), old_at))
+                if abs(float(old) - float(new)) > 0.01:
+                    changes.append((rid, new, now))
             elif abs(float(old) - float(new)) > 0.01:
                 changes.append((rid, new, now))
 
@@ -493,7 +514,7 @@ def note_fetch_failure(conn, advert_id, error=""):
     )
 
 
-def mark_missing(conn, seen_ids, list_scan_complete):
+def mark_missing(conn, seen_ids, list_scan_complete, grace_seconds=None):
     """
     seen_ids — id, реально увиденные в ЭТОМ прогоне.
 
@@ -504,6 +525,19 @@ def mark_missing(conn, seen_ids, list_scan_complete):
     пропавшие. У fast track окно в 5 страниц, ему это право не положено
     никогда.
 
+    ОТСРОЧКА (grace_seconds). Пропуск из ОДНОГО обхода ещё не значит, что
+    объявление снято. Список на krisha отсортирован по дате, новые
+    объявления вставляются в начало и сдвигают остальные вниз; обход 150
+    страниц идёт минутами, поэтому объявление, стоявшее внизу пятой
+    страницы, к моменту чтения шестой уезжает на неё и в снимок не
+    попадает вовсе. Без отсрочки такие строки уходят в missing, на
+    следующем обходе возвращаются в active, и так по кругу — а baseline
+    собирается ровно в тот момент, когда часть живых объявлений помечена
+    снятыми.
+
+    Поэтому missing ставится только тем, кого не видели дольше
+    grace_seconds. Один пропущенный обход прощается, два подряд — нет.
+
     Ничего не удаляет, last_seen_at не трогает. Возвращает число вновь
     помеченных.
     """
@@ -511,14 +545,23 @@ def mark_missing(conn, seen_ids, list_scan_complete):
         return 0
     if not seen_ids:
         return 0
+    if grace_seconds is None:
+        grace_seconds = MISSING_GRACE_SECONDS
+
+    cutoff = (datetime.now(timezone.utc) - timedelta(seconds=grace_seconds)).isoformat(
+        timespec="seconds")
+
     conn.execute("CREATE TEMP TABLE IF NOT EXISTS seen_now (id TEXT PRIMARY KEY)")
     conn.execute("DELETE FROM seen_now")
     conn.executemany("INSERT OR IGNORE INTO seen_now (id) VALUES (?)", [(i,) for i in seen_ids])
     cur = conn.execute(
         """
         UPDATE listings SET status = 'missing'
-        WHERE status IS NOT 'missing' AND id NOT IN (SELECT id FROM seen_now)
-        """
+        WHERE status IS NOT 'missing'
+          AND id NOT IN (SELECT id FROM seen_now)
+          AND (last_seen_at IS NULL OR last_seen_at < ?)
+        """,
+        (cutoff,),
     )
     marked = cur.rowcount or 0
     conn.execute("DROP TABLE IF EXISTS seen_now")

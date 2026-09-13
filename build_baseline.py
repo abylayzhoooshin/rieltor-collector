@@ -43,19 +43,24 @@ import sqlite3
 from collections import Counter
 from datetime import datetime, timezone
 
+import paths
 import master_db
 import price_index
 from dedupe_baseline import dedupe_rows
 
 log = logging.getLogger("build_baseline")
 
-BASELINE_DIR = os.environ.get("BASELINE_DIR", "baseline_versions")
+BASELINE_DIR = paths.baseline_dir()
 LATEST_POINTER = os.path.join(BASELINE_DIR, "latest.json")
 
 # Сколько последних версий держать на диске (для отката/отладки).
 # Версия, на которую указывает latest.json, никогда не считается
 # "старой" для целей удаления, даже если она за пределами этого числа.
 KEEP_VERSIONS = 3
+
+# Максимально допустимое сокращение baseline относительно опубликованной
+# версии. Больше — считаем сбоем сбора и не публикуем.
+MAX_SHRINK_RATIO = float(os.environ.get("BASELINE_MAX_SHRINK", "0.25"))
 
 # ============================== САНИТАРНЫЕ ГРАНИЦЫ ==============================
 # Не "дорого/дёшево", а "такого не бывает": опечатка в цене, комната
@@ -75,6 +80,12 @@ PRICE_M2_ABS_MIN = 1_500.0
 PRICE_M2_ABS_MAX = 40_000.0
 ASTANA_LAT_RANGE = (50.5, 52.0)
 ASTANA_LON_RANGE = (70.5, 72.5)
+
+# Как krisha называет город. В данных сейчас везде "Astana", но
+# написание может смениться при смене локали/вёрстки, поэтому список, а
+# не одна строка. Пустой city не отсеивается — отсутствие признака не
+# улика против.
+CITY_ALIASES = {"astana", "астана", "нур-султан", "nur-sultan", "nursultan"}
 
 
 # ============================== фильтрация (Stage 1-lite, без LLM) ==============================
@@ -119,6 +130,14 @@ def rejection_reason(row):
                 and ASTANA_LON_RANGE[0] <= lon <= ASTANA_LON_RANGE[1]):
             return "координаты вне Астаны"
 
+    # Название города — проверка копеечная и ловит то, что геобокс
+    # пропускает: строку из другого города БЕЗ координат. Геобокс
+    # срабатывает только когда обе координаты заполнены, а city есть
+    # у 100% строк.
+    city = (row.get("city") or "").strip().lower()
+    if city and city not in CITY_ALIASES:
+        return f"город: {row.get('city')}"
+
     return None
 
 
@@ -160,7 +179,17 @@ def _write_version_db(path, rows, fieldnames, meta):
         os.remove(tmp)
     conn = sqlite3.connect(tmp)
     try:
-        cols_ddl = ", ".join(f'"{c}" TEXT' for c in fieldnames if c != "id")
+        # Типы берём из master_db._TYPE_SQL, а не объявляем всё TEXT.
+        # У TEXT-колонки текстовая аффинность: SQLite конвертирует число
+        # при вставке, и потребитель получал "price": "450000" строкой.
+        # Любое сравнение без явного приведения на его стороне работало
+        # лексикографически, где "90000" > "450000" — то есть сервис,
+        # вся задача которого сравнивать цены, отдавал данные в виде,
+        # провоцирующем неверное сравнение.
+        cols_ddl = ", ".join(
+            f'"{c}" {master_db._TYPE_SQL.get(c, "TEXT")}'
+            for c in fieldnames if c != "id"
+        )
         conn.execute(f'CREATE TABLE baseline (id TEXT PRIMARY KEY, {cols_ddl})')
         conn.execute(
             "CREATE TABLE meta (version TEXT, built_at TEXT, row_count INTEGER, "
@@ -200,6 +229,16 @@ def _write_version_db(path, rows, fieldnames, meta):
         raise
     else:
         conn.close()
+    # fsync перед переименованием. Без него rename может попасть в
+    # журнал ФС раньше, чем содержимое файла: при жёстком крэше хоста
+    # (не процесса) под финальным именем окажется файл с дырами. Ирония
+    # исходной версии была в том, что килобайтный latest.json
+    # fsync'ался, а многомегабайтная база — нет.
+    fd = os.open(tmp, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
     os.replace(tmp, path)
 
 
@@ -226,6 +265,17 @@ def _version_file_is_valid(path, expected_rows):
         return False
     finally:
         conn.close()
+
+
+def _read_pointer():
+    """Текущий опубликованный указатель (или None)."""
+    if not os.path.exists(LATEST_POINTER):
+        return None
+    try:
+        with open(LATEST_POINTER, encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return None
 
 
 def _write_pointer_atomic(pointer_path, payload):
@@ -307,12 +357,37 @@ def build():
         len(filtered), len(kept), dedupe_stats["groups"],
         dedupe_stats["dropped"], dedupe_stats["candidate_pairs"],
     )
+    if dedupe_stats.get("skipped_rows"):
+        # Без этой строки «дублей не нашлось» и «блоки не рассматривались»
+        # выглядят в логе одинаково.
+        log.warning(
+            "дедуп пропустил %s строк в %s слишком крупных блоках — "
+            "в них дубли не искались",
+            dedupe_stats["skipped_rows"], dedupe_stats["skipped_blocks"],
+        )
 
     if len(kept) < 10:
         raise ValueError(
             f"Baseline получился слишком маленьким ({len(kept)} строк) — "
             "не публикую версию, чтобы не подсунуть скорингу пустышку."
         )
+
+    # Защита от тихого обвала. Порога "< 10" недостаточно: падение с
+    # 3000 строк до 200 — это явно сбой сбора (обрезанный список,
+    # блокировка, потерянный кусок CSV), но оно прошло бы молча и
+    # опубликовалось как валидная версия. Сравниваем с тем, что уже
+    # опубликовано, и при резком падении отказываемся публиковать —
+    # старая версия остаётся доступной, а в логе появляется причина.
+    previous = _read_pointer()
+    if previous and previous.get("row_count"):
+        prev_rows = int(previous["row_count"])
+        if prev_rows >= 100 and len(kept) < prev_rows * (1 - MAX_SHRINK_RATIO):
+            raise ValueError(
+                f"Baseline сократился с {prev_rows} до {len(kept)} строк "
+                f"(более {MAX_SHRINK_RATIO:.0%}) — не публикую. Похоже на сбой "
+                f"сбора, а не на реальное изменение рынка. Прошлая версия "
+                f"остаётся опубликованной."
+            )
 
     version = _row_version(kept)
     built_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
