@@ -13,6 +13,7 @@ FastAPI-сервис поверх baseline_versions/, который собир�
 """
 import json
 import os
+import time
 import secrets
 import sqlite3
 
@@ -43,6 +44,13 @@ DEFAULT_PAGE_SIZE = 100
 # 503. По умолчанию — два интервала полного обхода (6ч), то есть один
 # пропущенный цикл ещё нормально, два подряд уже нет.
 STALE_AFTER_SECONDS = int(os.environ.get("BASELINE_STALE_AFTER_S", str(2 * 6 * 3600)))
+
+# Сколько ждать ПЕРВОГО baseline на пустом диске, прежде чем считать
+# это поломкой. Полный обход идёт ~1.5ч, берём с запасом на ретраи.
+STARTUP_GRACE_SECONDS = int(os.environ.get("BASELINE_STARTUP_GRACE_S", str(4 * 3600)))
+
+# Момент старта процесса. monotonic, чтобы не зависеть от перевода часов.
+_STARTED_AT = time.monotonic()
 
 app = FastAPI(title="rieltor-baseline")
 
@@ -169,10 +177,36 @@ def health():
     """
     pointer = _read_pointer()
     if pointer is None:
+        # baseline ещё НИ РАЗУ не собирался.
+        #
+        # Здесь намеренно 200, а не 503, хотя данных нет. Это состояние
+        # первого запуска на пустом диске: master_db пуста, полный обход
+        # идёт полтора часа, и до его конца собирать baseline не из чего.
+        #
+        # 503 в этот момент означал бы провал healthcheck: платформа
+        # сочла бы деплой неудачным и перезапустила сервис — оборвав
+        # тот самый обход, который должен наполнить базу. Следующий
+        # запуск начал бы обход заново и был бы убит так же. Сервис
+        # никогда бы не поднялся, а в логах был бы бесконечный цикл
+        # перезапусков.
+        #
+        # Перезапуск тут не лечит — значит, просить его не надо.
+        # Но и молчать вечно нельзя: если baseline не появился за
+        # STARTUP_GRACE_SECONDS, это уже не запуск, а поломка.
+        uptime = time.monotonic() - _STARTED_AT
+        if uptime > STARTUP_GRACE_SECONDS:
+            return JSONResponse(
+                {"status": "broken", "baseline_ready": False,
+                 "uptime_seconds": int(uptime),
+                 "detail": f"baseline не собран за {uptime / 3600:.1f}ч — "
+                           "проверьте логи сбора"},
+                status_code=503,
+            )
         return JSONResponse(
             {"status": "starting", "baseline_ready": False,
-             "detail": "baseline ещё не собран"},
-            status_code=503,
+             "uptime_seconds": int(uptime),
+             "detail": "идёт первичное наполнение базы, baseline ещё не собран"},
+            status_code=200,
         )
 
     age = None
