@@ -110,10 +110,11 @@ async def find_card_id():
         status, body = await get(s, LIST_URL, "поиск id: страница списка")
         if status != 200:
             return None
-        m = re.search(r'class="a-card[^"]*"[^>]*data-id="(\d+)"', body)
-        if not m:
-            m = re.search(r'data-id="(\d+)"', body)
-        return m.group(1) if m else None
+        # id объявления — длинное число. Короткие data-id ("2" и т.п.)
+        # висят на служебных блоках вёрстки, и прошлый прогон поймал
+        # именно такой: проверялась несуществующая карточка /a/show/2.
+        ids = re.findall(r'data-id="(\d{6,})"', body)
+        return ids[0] if ids else None
 
 
 async def main():
@@ -165,6 +166,30 @@ async def main():
     async with new_session(headers=headers) as s:
         results["карточка с Referer и sec-ch-ua"] = (
             await get(s, card_url, "4. карточка, полный набор заголовков"))[0]
+    await asyncio.sleep(PAUSE)
+
+    # 4b. Повторяемость. Один и тот же запрос пять раз в одной сессии
+    # с куками: стабильно проходит или как повезёт. Смотреть на
+    # X-Kls-Bucket — A значит дошли до приложения, B значит попали
+    # на проверку SafeLine.
+    print(f"\n{'=' * 70}\n[4b. пять повторов, сессия с куками]")
+    buckets = []
+    async with new_session(cookies=True) as s:
+        await get(s, LIST_URL, "4b.0 разогрев: список")
+        for i in range(5):
+            await asyncio.sleep(PAUSE)
+            try:
+                async with s.get(
+                    card_url, timeout=aiohttp.ClientTimeout(total=25)
+                ) as resp:
+                    bucket = resp.headers.get("X-Kls-Bucket", "?")
+                    print(f"    попытка {i + 1}: статус {resp.status}, "
+                          f"bucket {bucket}")
+                    buckets.append(f"{resp.status}/{bucket}")
+            except Exception as e:
+                print(f"    попытка {i + 1}: исключение {e!r}")
+                buckets.append("err")
+    results["пять повторов с куками"] = " ".join(buckets)
     await asyncio.sleep(PAUSE)
 
     # 5. curl с того же хоста — другой TLS-стек, тот же адрес.
