@@ -2,19 +2,20 @@
 service.py — единственная точка входа микросервиса сбора+чистки+API.
 
 Один процесс = два конкурентных цикла в одном event loop:
-    1. orchestrator.Orchestrator().loop() — сбор (full scan раз в
-       FULL_SCAN_INTERVAL_H часов, fast track раз в FAST_INTERVAL_MIN
-       минут) + пересборка baseline после каждого full scan (см. патч
-       run_full_scan в orchestrator.py).
-    2. uvicorn.Server(...).serve() — FastAPI (baseline_api:app), отдаёт
-       готовый baseline по HTTP основному боту-оценщику.
+
+  1. orchestrator.Orchestrator().loop() — сбор (full scan раз в
+     FULL_SCAN_INTERVAL_H часов, fast track раз в FAST_INTERVAL_MIN
+     минут) + пересборка baseline после каждого full scan (см. патч
+     run_full_scan в orchestrator.py).
+  2. uvicorn.Server(...).serve() — FastAPI (baseline_api:app), отдаёт
+     готовый baseline по HTTP основному боту-оценщику.
 
 ПОЧЕМУ ОДИН ПРОЦЕСС, А НЕ ДВА ОТДЕЛЬНО ЗАПУЩЕННЫХ.
-    Один под/контейнер, один restart-policy, один healthcheck (см. ниже),
-    один лог. Гонка между "сборщик пишет" и "API читает" и так исключена
-    на уровне файлов (build_baseline.py публикует НЕИЗМЕНЯЕМЫЕ версии +
-    маленький atomic-replace pointer), так что общий процесс ничего не
-    усложняет по сравнению с раздельными.
+Один под/контейнер, один restart-policy, один healthcheck (см. ниже),
+один лог. Гонка между "сборщик пишет" и "API читает" и так исключена
+на уровне файлов (build_baseline.py публикует НЕИЗМЕНЯЕМЫЕ версии +
+маленький atomic-replace pointer), так что общий процесс ничего не
+усложняет по сравнению с раздельными.
 
 ЕСЛИ ПОЗЖЕ ПОНАДОБИТСЯ МАСШТАБИРОВАТЬ API ОТДЕЛЬНО от скрейпера
 (например, несколько реплик FastAPI перед одним baseline_versions/ на
@@ -25,6 +26,7 @@ service.py — единственная точка входа микросерв
 ОСТАНОВКА. SIGINT/SIGTERM останавливают ОБА цикла: оркестратор
 доскребает текущий прогон и выходит по своей логике (см.
 orchestrator.request_stop), uvicorn — через server.should_exit.
+
 Если один из двух корутин падает необработанным исключением,
 asyncio.gather роняет весь процесс — под supervisor'ом (systemd/docker
 restart=always) это лучше, чем тихо остаться наполовину живым
@@ -32,15 +34,25 @@ restart=always) это лучше, чем тихо остаться наполо
 отдавать всё более устаревающий baseline).
 
 ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ:
-    BASELINE_API_HOST   (default 0.0.0.0)
-    BASELINE_API_PORT   (default 8001)
-    KRISHA_DB           (см. master_db.py, путь к sqlite базе коллектора)
-    BASELINE_DIR        (см. build_baseline.py / baseline_api.py)
+  BASELINE_API_HOST   (default 0.0.0.0)
+  BASELINE_API_PORT   (default 8001)
+  KRISHA_DB           (см. master_db.py, путь к sqlite базе коллектора)
+  BASELINE_DIR        (см. build_baseline.py / baseline_api.py)
+  COLLECTOR_PAUSED    (1/true/yes — не запускать оркестратор, см. ниже)
+
+ПАУЗА СБОРА. COLLECTOR_PAUSED=1 поднимает только API, без единого
+запроса к krisha. Нужно для диагностики: когда руками гоняешь пробы
+(diag_468.py), параллельно работающий сборщик стучится с того же
+адреса, и непонятно, чей запрос что спровоцировал. Состоянию пауза
+ничем не грозит — база и orchestrator_state.json лежат на диске.
+Переменная правится в дашборде Render, сохранение само перезапускает
+сервис, отдельный деплой не нужен.
 
 Запуск:
-    python service.py
-    python service.py --log run.log     # как у orchestrator.py, дублировать вывод в файл
+  python service.py
+  python service.py --log run.log   # как у orchestrator.py, дублировать вывод в файл
 """
+
 import argparse
 import asyncio
 import logging
@@ -56,6 +68,13 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import orchestrator
 import baseline_api
+
+
+def collector_paused():
+    """True, если сбор выключен через окружение."""
+    return os.environ.get("COLLECTOR_PAUSED", "").strip().lower() in (
+        "1", "true", "yes", "on"
+    )
 
 
 class _DropHealthAccessLogs(logging.Filter):
@@ -106,7 +125,6 @@ def setup_logging(log_path=None):
         datefmt="%Y-%m-%d %H:%M:%S",
         handlers=handlers,
     )
-
     # Фильтр вешаем на логгер uvicorn.access — именно он печатает
     # строки вида 'GET /health HTTP/1.1" 200 OK'.
     logging.getLogger("uvicorn.access").addFilter(_DropHealthAccessLogs())
@@ -118,13 +136,17 @@ async def main():
     args = parser.parse_args()
 
     setup_logging(args.log)
-
     if args.log:
         # print() воркеров — в тот же файл. Tee пишет БЕЗ ротации, но
         # объём print-вывода на порядки меньше, чем у logging.
         sys.stdout = orchestrator.Tee(sys.stdout, args.log)
         sys.stderr = sys.stdout
 
+    paused = collector_paused()
+
+    # Оркестратор создаём в любом случае: на нём висит request_stop,
+    # который дёргает обработчик сигналов. На паузе его loop() просто
+    # не запускается, то есть ни одного запроса к krisha не уходит.
     orch = orchestrator.Orchestrator()
 
     config = uvicorn.Config(
@@ -151,18 +173,29 @@ async def main():
         except NotImplementedError:  # Windows
             signal.signal(sig, _stop)
 
-    orchestrator.log(
-        f"🚀 Микросервис запущен. API на :{config.port}, "
-        f"сбор по расписанию оркестратора (full scan каждые "
-        f"{orchestrator.FULL_SCAN_INTERVAL_H_MIN}-"
-        f"{orchestrator.FULL_SCAN_INTERVAL_H_MAX}ч, fast track каждые "
-        f"{orchestrator.FAST_INTERVAL_MIN_MIN:.0f}-"
-        f"{orchestrator.FAST_INTERVAL_MIN_MAX:.0f}мин, "
-        f"момент выбирается случайно внутри диапазона)."
-    )
+    if paused:
+        orchestrator.log(
+            "⏸️  COLLECTOR_PAUSED=1 — оркестратор НЕ запущен, работает только "
+            f"API на :{config.port}. Сбор не идёт, ни одного запроса к krisha "
+            "не уходит. Убери переменную в дашборде, чтобы вернуть сбор."
+        )
+    else:
+        orchestrator.log(
+            f"🚀 Микросервис запущен. API на :{config.port}, "
+            f"сбор по расписанию оркестратора (full scan каждые "
+            f"{orchestrator.FULL_SCAN_INTERVAL_H_MIN}-"
+            f"{orchestrator.FULL_SCAN_INTERVAL_H_MAX}ч, fast track каждые "
+            f"{orchestrator.FAST_INTERVAL_MIN_MIN:.0f}-"
+            f"{orchestrator.FAST_INTERVAL_MIN_MAX:.0f}мин, "
+            f"момент выбирается случайно внутри диапазона)."
+        )
+
+    coros = [server.serve()]
+    if not paused:
+        coros.insert(0, orch.loop())
 
     try:
-        await asyncio.gather(orch.loop(), server.serve())
+        await asyncio.gather(*coros)
     except Exception:
         orchestrator.log(f"💥 Микросервис упал:\n{traceback.format_exc()}")
         raise
