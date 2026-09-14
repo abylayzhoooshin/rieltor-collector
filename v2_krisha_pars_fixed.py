@@ -155,7 +155,32 @@ HEADERS = {
         "(KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36"
     ),
     "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
+    # Остальные заголовки — как их шлёт настоящий Chrome. Сами по себе
+    # они проблему 468 не объясняют (на списке хватало и двух), но
+    # приближают запрос к браузерному без каких-либо издержек.
+    "Accept": ("text/html,application/xhtml+xml,application/xml;q=0.9,"
+               "image/avif,image/webp,*/*;q=0.8"),
+    "Accept-Encoding": "gzip, deflate, br",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Connection": "keep-alive",
 }
+
+
+def _new_session():
+    """Свежая сессия БЕЗ хранилища куки.
+
+    DummyCookieJar означает: полученные Set-Cookie не сохраняются и не
+    отправляются обратно. Именно накопленная за 169 запросов кука —
+    главный подозреваемый в том, что карточки стали отдавать 468, тогда
+    как одиночный curl без куки с того же IP получает 200.
+    """
+    return aiohttp.ClientSession(
+        headers=HEADERS,
+        cookie_jar=aiohttp.DummyCookieJar(),
+    )
 
 LIST_FIELDNAMES = ["id", "url", "price", "page_number", "scraped_at"]
 
@@ -867,12 +892,32 @@ async def run_cycle(stage="all", session=None):
     """
     own_session = session is None
     if own_session:
-        session = aiohttp.ClientSession(headers=HEADERS)
+        session = _new_session()
     try:
         if stage in ("list", "all"):
             await run_list_stage(session)
         if stage in ("detail", "all"):
-            await run_detail_stage(session)
+            # ОТДЕЛЬНАЯ СЕССИЯ ДЛЯ КАРТОЧЕК.
+            #
+            # Наблюдение с прода: уровень 1 спокойно качает 169 страниц
+            # списка, а первый же запрос карточки отдаёт 468. При этом
+            # ручной curl к ТОЙ ЖЕ карточке с ТОГО ЖЕ IP возвращает 200.
+            # Значит дело не в адресе и не в частоте (паузы 4-6с), и не
+            # в заголовках — они те же, что работали на списке.
+            #
+            # Отличие ровно одно: к началу уровня 2 сессия уже сделала
+            # 169 запросов и накопила куки krisha. Похоже, по этой
+            # сессии нас и помечают. Свежая сессия без куки-хранилища
+            # (DummyCookieJar) ставит нас в те же условия, что и curl.
+            #
+            # Если 468 повторится и на свежей сессии — гипотеза неверна,
+            # и копать надо в другом месте (TLS-отпечаток, поведенческие
+            # сигналы). Проверяется одним прогоном.
+            detail_session = _new_session()
+            try:
+                await run_detail_stage(detail_session)
+            finally:
+                await detail_session.close()
     finally:
         if own_session:
             await session.close()

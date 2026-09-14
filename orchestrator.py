@@ -110,6 +110,11 @@ BASELINE_BUILD_INTERVAL_MIN = float(os.environ.get("BASELINE_BUILD_INTERVAL_MIN"
 # предсказуемость рисунка, а именно регулярность и выдаёт автомат.
 FAST_INTERVAL_MIN_MIN = float(os.environ.get("FAST_INTERVAL_MIN_MIN", "50"))
 FAST_INTERVAL_MIN_MAX = float(os.environ.get("FAST_INTERVAL_MIN_MAX", "70"))
+# Запустить полный обход сразу при старте, не дожидаясь расписания.
+# Для отладки: включили, проверили, ВЫКЛЮЧИЛИ. Если оставить, каждый
+# редеплой будет тянуть полный обход.
+FORCE_SCAN_ON_START = os.environ.get("FORCE_SCAN_ON_START", "0") in ("1", "true", "True")
+
 FULL_SCAN_INTERVAL_H_MIN = float(os.environ.get("FULL_SCAN_INTERVAL_H_MIN", "5"))
 FULL_SCAN_INTERVAL_H_MAX = float(os.environ.get("FULL_SCAN_INTERVAL_H_MAX", "6"))
 
@@ -297,7 +302,7 @@ class Orchestrator:
         # Одна сессия на весь процесс: keep-alive и один набор cookie
         # выглядят для сайта естественнее, чем новое соединение каждые
         # пять минут.
-        async with aiohttp.ClientSession(headers=full_scan.HEADERS) as session:
+        async with full_scan._new_session() as session:
             with master_db.connect() as conn:
                 s = master_db.stats(conn)
             log(
@@ -333,6 +338,24 @@ class Orchestrator:
                 except Exception:
                     log(f"❌ warmup не удался:\n{traceback.format_exc()}")
                 self.schedule("next_fast", fast_interval, span=fast_span)
+
+            # Принудительный обход сразу при старте, минуя расписание.
+            #
+            # Обычно расписание намеренно переживает рестарт (см. schedule):
+            # иначе каждый редеплой запускал бы полуторачасовой обход
+            # заново. Но при отладке это мешает — приходится ждать 5-6
+            # часов, чтобы проверить правку.
+            #
+            # FORCE_SCAN_ON_START=1 сбрасывает отметку следующего обхода,
+            # и цикл ниже стартует немедленно. Переменную стоит убирать
+            # после проверки, иначе КАЖДЫЙ рестарт будет запускать
+            # полный обход — а это лишняя нагрузка на источник, из-за
+            # которой и прилетала блокировка.
+            if FORCE_SCAN_ON_START:
+                log("⚡ FORCE_SCAN_ON_START=1 — запускаю полный обход немедленно, "
+                    "не дожидаясь расписания.")
+                self.state.pop("next_full", None)
+                save_state(self.state)
 
             while not self.stopping:
                 # Полный обход приоритетнее: он и есть сборщик базы.
@@ -393,7 +416,7 @@ async def main():
         sys.stderr = sys.stdout
 
     if args.once:
-        async with aiohttp.ClientSession(headers=full_scan.HEADERS) as session:
+        async with full_scan._new_session() as session:
             if args.once == "full":
                 await run_full_scan(session)
             else:

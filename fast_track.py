@@ -218,7 +218,11 @@ def write_output(path, rows):
 async def run(known_ids_path, output_path, max_pages, concurrency, warmup=False, session=None):
     own_session = session is None
     if own_session:
-        session = aiohttp.ClientSession(headers=HEADERS)
+        # Без хранилища куки — та же причина, что в
+        # v2_krisha_pars_fixed._new_session: накопленная сессия
+        # выглядит для антибота хуже, чем свежая.
+        session = aiohttp.ClientSession(
+            headers=HEADERS, cookie_jar=aiohttp.DummyCookieJar())
     try:
         pages = await scan_window(session, max_pages)
         if not pages:
