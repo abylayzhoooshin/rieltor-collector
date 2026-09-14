@@ -47,6 +47,7 @@ import json
 import os
 import signal
 import sys
+import random
 import time
 import traceback
 from datetime import datetime, timezone
@@ -66,7 +67,10 @@ import paths
 # Как часто делать ПОЛНЫЙ обход всех страниц. Актуальность цены не
 # критична, а полный обход — самая тяжёлая операция, поэтому реже, чем
 # может показаться. 6 часов = 4 полных среза рынка в сутки.
-FULL_SCAN_INTERVAL_H = 6.0
+# Полный обход: середина запрошенного диапазона 5-6ч.
+# Фактический момент запуска разбрасывается в schedule() (см.
+# SCHEDULE_JITTER), поэтому здесь именно СРЕДНЕЕ, а не жёсткое значение.
+FULL_SCAN_INTERVAL_H = float(os.environ.get("FULL_SCAN_INTERVAL_H", "5.5"))
 
 # Как часто крутить окно первых страниц. Тут запросов мало
 # (FAST_LIST_MAX_PAGES страниц + карточки только реально новых id).
@@ -92,6 +96,22 @@ FAST_INTERVAL_MIN = float(os.environ.get("FAST_INTERVAL_MIN", "60"))
 # Как часто пересобирать baseline. Не привязано к обходу: данные в
 # master_db есть всегда, а обход может быть прерван рестартом.
 BASELINE_BUILD_INTERVAL_MIN = float(os.environ.get("BASELINE_BUILD_INTERVAL_MIN", "30"))
+
+# ДИАПАЗОНЫ запуска задаются явно, а не одной долей разброса.
+#
+# Общая доля не годится: чтобы fast track попадал в 50-70 минут, нужен
+# разброс ±16.7%, а чтобы полный обход попадал в 5-6 часов — ±9.1%.
+# С единым процентом один из диапазонов обязательно вылезет за границы
+# (проверено: при 16.7% полный обход уходил в 4.6-6.4ч, и только 54%
+# запусков попадали в требуемые 5-6ч).
+#
+# Момент внутри диапазона выбирается равномерно. Средняя частота
+# обращений к сайту от этого не растёт — меняется только
+# предсказуемость рисунка, а именно регулярность и выдаёт автомат.
+FAST_INTERVAL_MIN_MIN = float(os.environ.get("FAST_INTERVAL_MIN_MIN", "50"))
+FAST_INTERVAL_MIN_MAX = float(os.environ.get("FAST_INTERVAL_MIN_MAX", "70"))
+FULL_SCAN_INTERVAL_H_MIN = float(os.environ.get("FULL_SCAN_INTERVAL_H_MIN", "5"))
+FULL_SCAN_INTERVAL_H_MAX = float(os.environ.get("FULL_SCAN_INTERVAL_H_MAX", "6"))
 
 # Запускать ли fast track вообще. Базу целиком собирает full scan; fast
 # track нужен, только если хочется ловить новые объявления в течение
@@ -223,11 +243,25 @@ class Orchestrator:
     def due(self, key, interval_s):
         return time.time() >= self.state.get(key, 0)
 
-    def schedule(self, key, interval_s):
+    def schedule(self, key, interval_s, span=None):
+        """Ставит следующий запуск.
+
+        span — кортеж (min_s, max_s): момент выбирается равномерно
+        внутри диапазона. Если не задан, используется ровно interval_s.
+
+        ЗАЧЕМ РАЗБРОС. Фиксированный интервал даёт идеально регулярный
+        рисунок запросов: каждый час минута в минуту, каждые шесть часов
+        минута в минуту. Для антибот-систем такая регулярность сама по
+        себе признак автомата — живой человек так не ходит. После того
+        как krisha начала отвечать кодом 468 (блокировка), сглаживание
+        этого рисунка перестало быть косметикой.
+        """
+        if span:
+            interval_s = random.uniform(span[0], span[1])
         self.state[key] = time.time() + interval_s
         save_state(self.state)
 
-    async def run_task(self, name, key, interval_s, coro_factory, session):
+    async def run_task(self, name, key, interval_s, coro_factory, session, span=None):
         # Расписание пишется ДО запуска задачи, а не после успешного
         # возврата. Раньше schedule() стоял после await: если процесс
         # убивали посреди полуторачасового обхода (редеплой, OOM,
@@ -241,7 +275,7 @@ class Orchestrator:
         # не повторён немедленно. Для сбора это верный размен — лишний
         # пропущенный обход дешевле бесконечного цикла перезапусков,
         # добивающего и сайт, и инстанс.
-        self.schedule(key, interval_s)
+        self.schedule(key, interval_s, span=span)
         self.state["last_started_" + key] = time.time()
         save_state(self.state)
         try:
@@ -257,6 +291,8 @@ class Orchestrator:
         full_interval = FULL_SCAN_INTERVAL_H * 3600
         fast_interval = FAST_INTERVAL_MIN * 60
         build_interval = BASELINE_BUILD_INTERVAL_MIN * 60
+        full_span = (FULL_SCAN_INTERVAL_H_MIN * 3600, FULL_SCAN_INTERVAL_H_MAX * 3600)
+        fast_span = (FAST_INTERVAL_MIN_MIN * 60, FAST_INTERVAL_MIN_MAX * 60)
 
         # Одна сессия на весь процесс: keep-alive и один набор cookie
         # выглядят для сайта естественнее, чем новое соединение каждые
@@ -269,9 +305,12 @@ class Orchestrator:
                 f"missing {s['missing']}, полных карточек {s['complete']}"
             )
             log(
-                f"Расписание: full scan каждые {FULL_SCAN_INTERVAL_H}ч, "
+                f"Расписание: full scan каждые "
+                f"{FULL_SCAN_INTERVAL_H_MIN}-{FULL_SCAN_INTERVAL_H_MAX}ч, "
                 + (
-                    f"fast track каждые {FAST_INTERVAL_MIN}мин."
+                    f"fast track каждые "
+                    f"{FAST_INTERVAL_MIN_MIN:.0f}-{FAST_INTERVAL_MIN_MAX:.0f}мин "
+                    f"(момент выбирается случайно внутри диапазона)."
                     if ENABLE_FAST_TRACK
                     else "fast track ВЫКЛЮЧЕН."
                 )
@@ -293,13 +332,14 @@ class Orchestrator:
                     )
                 except Exception:
                     log(f"❌ warmup не удался:\n{traceback.format_exc()}")
-                self.schedule("next_fast", fast_interval)
+                self.schedule("next_fast", fast_interval, span=fast_span)
 
             while not self.stopping:
                 # Полный обход приоритетнее: он и есть сборщик базы.
                 if self.due("next_full", full_interval):
                     await self.run_task(
-                        "FULL SCAN", "next_full", full_interval, run_full_scan, session
+                        "FULL SCAN", "next_full", full_interval, run_full_scan, session,
+                        span=full_span
                     )
                     await asyncio.sleep(COOLDOWN_BETWEEN_RUNS_S)
                     continue
@@ -321,7 +361,8 @@ class Orchestrator:
 
                 if ENABLE_FAST_TRACK and self.due("next_fast", fast_interval):
                     await self.run_task(
-                        "FAST TRACK", "next_fast", fast_interval, run_fast_track, session
+                        "FAST TRACK", "next_fast", fast_interval, run_fast_track, session,
+                        span=fast_span
                     )
                     await asyncio.sleep(COOLDOWN_BETWEEN_RUNS_S)
                     continue

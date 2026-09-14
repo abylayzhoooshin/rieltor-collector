@@ -133,8 +133,11 @@ async def main():
     orchestrator.log(
         f"🚀 Микросервис запущен. API на :{config.port}, "
         f"сбор по расписанию оркестратора (full scan каждые "
-        f"{orchestrator.FULL_SCAN_INTERVAL_H}ч, fast track каждые "
-        f"{orchestrator.FAST_INTERVAL_MIN}мин)."
+        f"{orchestrator.FULL_SCAN_INTERVAL_H_MIN}-"
+        f"{orchestrator.FULL_SCAN_INTERVAL_H_MAX}ч, fast track каждые "
+        f"{orchestrator.FAST_INTERVAL_MIN_MIN:.0f}-"
+        f"{orchestrator.FAST_INTERVAL_MIN_MAX:.0f}мин, "
+        f"момент выбирается случайно внутри диапазона)."
     )
 
     try:

@@ -113,7 +113,19 @@ DETAIL_CONCURRENCY = 1
 CIRCUIT_BREAKER_FAILURES = 8
 CIRCUIT_BREAKER_COOLDOWN = 180.0
 
+# Сколько раз брейкер может сработать за один обход, прежде чем признать,
+# что нас просто не пускают, и прекратить обход. Без этого сервис
+# бесконечно чередовал бы "8 провалов -> пауза 180с -> 8 провалов",
+# усугубляя блокировку и не продвигаясь ни на шаг.
+MAX_BREAKER_TRIPS = int(os.environ.get("MAX_BREAKER_TRIPS", "3"))
+
 MAX_RETRIES = 3
+
+# Коды, при которых сайт отказывает осознанно, а не случайно.
+# 468 — нестандартный код, которым krisha.kz отвечает при блокировке
+# (наблюдался в проде: все карточки подряд отдавали 468, при том что
+# страницы списка до этого качались нормально).
+BLOCKING_STATUSES = {403, 429, 468, 503}
 RETRY_BASE_DELAY = 5.0
 
 # TTL/needs_fetch больше нет — парсер тупой исполнитель, качает ВСЕ id из
@@ -154,7 +166,15 @@ def save_progress(path, data):
 
 
 async def fetch_url(session, url, params=None):
-    """Общий загрузчик с ретраями. Возвращает HTML или None."""
+    """Общий загрузчик с ретраями. Возвращает HTML или None.
+
+    На кодах блокировки ретраи НЕ делаются. Смысл ретрая — пережить
+    случайный сбой; если сайт осознанно отказал (429, 403, 503 или
+    нестандартный 468, которым krisha отвечает при блокировке), то три
+    попытки подряд ничего не починят, а только добавят запросов в
+    момент, когда нас и так уже не пускают. Возвращаем None сразу,
+    брейкер уровнем выше посчитает это провалом и уйдёт в паузу.
+    """
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             async with session.get(
@@ -162,8 +182,11 @@ async def fetch_url(session, url, params=None):
             ) as resp:
                 if resp.status == 200:
                     return await resp.text()
-                else:
-                    print(f"   ⚠️  {url}: статус {resp.status} (попытка {attempt}/{MAX_RETRIES})")
+                if resp.status in BLOCKING_STATUSES:
+                    print(f"   🚫 {url}: статус {resp.status} — блокировка, "
+                          f"ретраи не помогут")
+                    return None
+                print(f"   ⚠️  {url}: статус {resp.status} (попытка {attempt}/{MAX_RETRIES})")
         except Exception as e:
             print(f"   ⚠️  {url}: ошибка {e!r} (попытка {attempt}/{MAX_RETRIES})")
 
@@ -553,6 +576,11 @@ async def _detail_worker(queue, session, state):
 
         # circuit breaker: если сайт похоже начал банить/капчить — не долбим дальше
         async with state["lock"]:
+            if state.get("abort"):
+                # Обход признан безнадёжным (см. MAX_BREAKER_TRIPS) —
+                # воркер выходит, не трогая очередь.
+                queue.task_done()
+                return
             if state["breaker_until"] and datetime.now(timezone.utc) < state["breaker_until"]:
                 cooldown = (state["breaker_until"] - datetime.now(timezone.utc)).total_seconds()
             else:
@@ -566,7 +594,23 @@ async def _detail_worker(queue, session, state):
         async with state["lock"]:
             if html is None:
                 print(f"   ⏭️  ID {advert_id} пропущен из-за ошибок сети")
-                _record_failure(state, advert_id, "network")
+                # ВАЖНО: сетевой отказ НЕ записывается в fetch_failures.
+                #
+                # Раньше писался наравне с "карточка неполная", а там
+                # после MAX_FETCH_ATTEMPTS (4) id навсегда выбывает из
+                # очереди на перекачку. При бане/блокировке по IP
+                # (krisha отвечает нестандартным статусом 468) подряд
+                # валятся ВСЕ запросы — и за 4 прогона весь текущий
+                # список объявлений оказался бы вычеркнут необратимо,
+                # уже после снятия бана.
+                #
+                # Разница принципиальная: "страница отдалась, но в ней
+                # нет данных" — это свойство объявления, его честно
+                # считать. "До страницы не достучались" — это свойство
+                # СЕТИ в данный момент, и объявление тут ни при чём.
+                # Такие id просто останутся неполными и попадут в
+                # очередь на следующем прогоне.
+                state["failed"] += 1
                 state["consecutive_failures"] += 1
                 if state["consecutive_failures"] >= CIRCUIT_BREAKER_FAILURES:
                     print(
@@ -577,6 +621,19 @@ async def _detail_worker(queue, session, state):
                         seconds=CIRCUIT_BREAKER_COOLDOWN
                     )
                     state["consecutive_failures"] = 0
+                    state["breaker_trips"] = state.get("breaker_trips", 0) + 1
+
+                    # Если брейкер срабатывает раз за разом, сайт нас не
+                    # пускает совсем. Продолжать долбиться бессмысленно и
+                    # вредно: мы только усугубляем блокировку. Выходим из
+                    # обхода, следующий цикл попробует заново.
+                    if state["breaker_trips"] >= MAX_BREAKER_TRIPS:
+                        print(
+                            f"   ⛔ Брейкер срабатывал {state['breaker_trips']} раз — "
+                            f"сайт стабильно не отдаёт карточки. Прерываю уровень 2, "
+                            f"чтобы не усугублять блокировку."
+                        )
+                        state["abort"] = True
             else:
                 state["consecutive_failures"] = 0
                 row = parse_detail_page(html, advert_id)
