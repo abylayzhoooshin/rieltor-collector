@@ -58,6 +58,23 @@ import orchestrator
 import baseline_api
 
 
+class _DropHealthAccessLogs(logging.Filter):
+    """Убирает из лога строки доступа к /health.
+
+    Render дёргает healthcheck каждые несколько секунд, и в логе
+    получается сплошное "GET /health HTTP/1.1 200 OK" — на сутки это
+    тысячи строк, в которых тонет всё содержательное: старты обходов,
+    блокировки, публикации baseline.
+
+    Фильтруем именно /health, а не выключаем access-лог целиком
+    (access_log=False): обращения к /baseline/table видеть нужно —
+    по ним понятно, ходит ли за данными сервис-потребитель.
+    """
+
+    def filter(self, record):
+        return "/health" not in record.getMessage()
+
+
 def setup_logging(log_path=None):
     """Единый поток логов для всего процесса.
 
@@ -89,6 +106,10 @@ def setup_logging(log_path=None):
         datefmt="%Y-%m-%d %H:%M:%S",
         handlers=handlers,
     )
+
+    # Фильтр вешаем на логгер uvicorn.access — именно он печатает
+    # строки вида 'GET /health HTTP/1.1" 200 OK'.
+    logging.getLogger("uvicorn.access").addFilter(_DropHealthAccessLogs())
 
 
 async def main():
