@@ -62,6 +62,11 @@ KEEP_VERSIONS = 3
 # версии. Больше — считаем сбоем сбора и не публикуем.
 MAX_SHRINK_RATIO = float(os.environ.get("BASELINE_MAX_SHRINK", "0.25"))
 
+# Пускать ли в baseline объявления, снятые с публикации (status='missing').
+# 1 — да (по умолчанию): архив снятых объявлений идёт в пул сравнения.
+# 0 — только активные.
+INCLUDE_MISSING = os.environ.get("INCLUDE_MISSING", "1") not in ("0", "false", "False", "")
+
 # ============================== САНИТАРНЫЕ ГРАНИЦЫ ==============================
 # Не "дорого/дёшево", а "такого не бывает": опечатка в цене, комната
 # вместо квартиры, объявление из другого города. Всё это попадало в пул
@@ -100,7 +105,7 @@ def rejection_reason(row):
     """
     if not master_db.is_complete(row):  # price/rooms/square_m2 не пустые
         return "неполная карточка (нет price/rooms/square_m2)"
-    if row.get("status") == "missing":
+    if not INCLUDE_MISSING and row.get("status") == "missing":
         return "status=missing"
 
     storage = (row.get("storage") or "").strip()
@@ -146,7 +151,24 @@ def passes_basic_filter(row):
 
 
 def load_active_rows(conn):
-    cur = conn.execute("SELECT * FROM listings WHERE status = 'active'")
+    """Строки для baseline.
+
+    По умолчанию берём ВСЕ объявления, включая снятые с публикации
+    (status='missing'). Архив снятых — это накопленная история рынка, и
+    для сравнения цен он полезен: объявлений в каждый момент времени на
+    сайте около трёх тысяч, а за месяцы их накапливаются десятки тысяч.
+
+    INCLUDE_MISSING=0 вернёт прежнее поведение (только активные), если
+    понадобится сравнить результаты.
+
+    Важно: цены снятых объявлений относятся к моменту, когда их видели
+    в последний раз (last_seen_at). Приведение к сегодняшним ценам
+    делается через price_index — ровно для этого случая он и писался.
+    """
+    if INCLUDE_MISSING:
+        cur = conn.execute("SELECT * FROM listings")
+    else:
+        cur = conn.execute("SELECT * FROM listings WHERE status = 'active'")
     return [dict(r) for r in cur.fetchall()]
 
 
