@@ -135,6 +135,17 @@ COOLDOWN_BETWEEN_RUNS_S = 30.0
 # задачу в расписание снова (защита от крэш-лупа при недоступном сайте).
 FAILURE_BACKOFF_MIN = 15.0
 
+# После блокировки (любой воркер вернул EXIT_BLOCKED) ни full scan, ни fast
+# track не стартуют раньше этого срока: иначе второй воркер через минуты
+# полез бы на сайт с того же IP и продлил бан.
+BLOCKED_COOLDOWN_MIN = float(os.environ.get("BLOCKED_COOLDOWN_MIN", "90"))
+
+EXIT_DESCRIPTIONS = {
+    full_scan.EXIT_BLOCKED: "блокировка антиботом",
+    full_scan.EXIT_LAYOUT_CHANGED: "сменилась разметка сайта",
+    full_scan.EXIT_NO_PAGES: "не загрузилась ни одна страница списка",
+}
+
 ORCH_STATE_FILE = paths.data_path("orchestrator_state.json")
 
 
@@ -199,15 +210,22 @@ def human(seconds):
 # ============================== ЗАДАЧИ ==============================
 
 
+def log_exit(name, code):
+    if code != full_scan.EXIT_OK:
+        log(f"⚠️  {name}: код {code} — {EXIT_DESCRIPTIONS.get(code, 'неизвестный код')}")
+
+
 async def run_full_scan(session):
     log("▶️  FULL SCAN старт")
     started = time.time()
-    await full_scan.run_cycle("all", session=session)
+    code = await full_scan.run_cycle("all", session=session)
+    log_exit("FULL SCAN", code)
     if EXPORT_CSV_AFTER_FULL_SCAN:
         with master_db.connect() as conn:
             path = master_db.export_csv(conn)
         log(f"💾 База выгружена в {path}")
     log(f"⏹  FULL SCAN завершён за {human(time.time() - started)}")
+    return code
 
 
 async def run_build_baseline(session=None):
@@ -266,6 +284,14 @@ class Orchestrator:
         self.state[key] = time.time() + interval_s
         save_state(self.state)
 
+    def postpone_after_block(self):
+        until = time.time() + BLOCKED_COOLDOWN_MIN * 60
+        for key in ("next_full", "next_fast"):
+            if self.state.get(key, 0) < until:
+                self.state[key] = until
+        save_state(self.state)
+        log(f"🧊 Блокировка — сбор приостановлен на {human(BLOCKED_COOLDOWN_MIN * 60)}.")
+
     async def run_task(self, name, key, interval_s, coro_factory, session, span=None):
         # Расписание пишется ДО запуска задачи, а не после успешного
         # возврата. Раньше schedule() стоял после await: если процесс
@@ -284,7 +310,8 @@ class Orchestrator:
         self.state["last_started_" + key] = time.time()
         save_state(self.state)
         try:
-            await coro_factory(session)
+            if await coro_factory(session) == full_scan.EXIT_BLOCKED:
+                self.postpone_after_block()
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -326,8 +353,9 @@ class Orchestrator:
             # висят на сайте, разом уедут в вывод как "новые".
             if ENABLE_FAST_TRACK and not os.path.exists(fast_track.FAST_KNOWN_IDS_FILE):
                 log("↪️  fast_known_ids.json не найден — делаю warmup-прогон fast track.")
+                code = None
                 try:
-                    await fast_track.run(
+                    code = await fast_track.run(
                         fast_track.FAST_KNOWN_IDS_FILE,
                         fast_track.FAST_NEW_LISTINGS_CSV,
                         fast_track.FAST_LIST_MAX_PAGES,
@@ -335,9 +363,12 @@ class Orchestrator:
                         warmup=True,
                         session=session,
                     )
+                    log_exit("FAST TRACK warmup", code)
                 except Exception:
                     log(f"❌ warmup не удался:\n{traceback.format_exc()}")
                 self.schedule("next_fast", fast_interval, span=fast_span)
+                if code == full_scan.EXIT_BLOCKED:
+                    self.postpone_after_block()
 
             # Принудительный обход сразу при старте, минуя расписание.
             #

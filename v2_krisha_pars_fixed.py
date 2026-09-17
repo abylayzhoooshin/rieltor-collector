@@ -1,59 +1,68 @@
 """
-Двухуровневый парсер объявлений Krisha.kz под методологию оценки v3.
+Двухуровневый парсер объявлений Krisha.kz (slow track / full scan).
 
-Уровень 1 (список): страницы /arenda/kvartiry/astana/?page=N — быстро собираем
-    ID всех объявлений (без захода в карточки).
-Уровень 2 (карточка): /a/show/{id} — здесь два источника данных на одной странице:
+Уровень 1 (список): страницы /arenda/kvartiry/astana/?page=N — id, цена и
+    номер страницы каждого объявления (без захода в карточки).
+Уровень 2 (карточка): /a/show/{id} — два источника данных на одной странице:
     - window.data (JSON в <script id="jsdata">) — цена, площадь, комнаты, ЖК как
       structured ID, полный список фото full-res, адрес по полям, координаты.
     - HTML-блоки .offer__info-item[data-name=...] — то, чего нет в JSON:
       этаж/этажность, состояние ремонта, меблировка, санузлы, бывшее общежитие
       и т.д. Плюс блок .js-description — полное описание (не обрезанное превью).
 
-Отдельной стадии похода на страницы ЖК (/complex/show/...) нет — она была,
-но убрана: не нужна. complex_id/complex_alias/complex_name всё ещё собираются,
-но только то, что и так есть на самой странице объявления, без лишних запросов.
+СЕТЬ. curl_cffi с отпечатком Chrome (TLS/HTTP2 + порядок заголовков), куки
+переживают прогоны (COOKIES_FILE), переходы идут с Referer — как клики по
+ссылкам внутри сайта. Этот же сетевой слой использует fast_track.py: одна
+реализация на всю систему, копии разъехались бы молча.
+
+Раньше здесь был aiohttp без куки (DummyCookieJar) и свежая сессия на
+уровень 2 — гипотеза "накопленная кука = 468". Не подтвердилась: SafeLine
+на krisha.kz выдаёт 468 по отпечатку клиента, а посетитель без куки для
+него каждый раз новый и подозрительный.
+
+БЛОКИРОВКА И СМЕНА РАЗМЕТКИ прерывают прогон сразу (AbortRun): повторы
+под антиботом только портят репутацию IP. run_cycle возвращает код
+EXIT_OK / EXIT_BLOCKED / EXIT_LAYOUT_CHANGED / EXIT_NO_PAGES; при
+блокировке куки сжигаются, ответ сайта сохраняется в BLOCKED_SAMPLE.
 
 ВАЖНО: методология v3 сформулирована под ПОКУПКУ (price/m2 продажи), а не аренду.
-Если нужен пилот под покупку — смените CATEGORY на "prodazha" ниже. Структура
-парсера (список -> карточки) одинакова для обоих разделов, различаются
-только некоторые поля на карточке (напр. для продажи может быть "рассрочка от
-застройщика" вместо "меблировка").
+Если нужен пилот под покупку — смените CATEGORY на "prodazha" ниже.
 
 Запуск:
-    python krisha_parser.py list      # только уровень 1 (быстро, собрать ID)
-    python krisha_parser.py detail    # только уровень 2 (детали по собранным ID)
-    python krisha_parser.py all       # оба уровня последовательно (по умолчанию)
-
-Настройки — в блоке CONFIG ниже.
+    python v2_krisha_pars_fixed.py list      # только уровень 1 (собрать ID)
+    python v2_krisha_pars_fixed.py detail    # только уровень 2 (по снимку списка)
+    python v2_krisha_pars_fixed.py all       # оба уровня последовательно (по умолчанию)
 """
-
 
 import asyncio
 import csv
 import hashlib
+import http.cookiejar
 import json
+import os
 import random
 import re
-import os
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 
-import aiohttp
 from bs4 import BeautifulSoup
+from curl_cffi.const import CurlOpt
+from curl_cffi.requests import AsyncSession
+from curl_cffi.requests.exceptions import RequestException as CurlRequestError
 
 import master_db
 import paths
 
 # ============================== CONFIG ==============================
 
-BASE_URL = "https://krisha.kz/"
+BASE_URL = "https://krisha.kz"
 
 # "arenda" — аренда (текущий пилот). "prodazha" — продажа (под методологию v3).
 CATEGORY = "arenda"
 CITY = "astana"
 
-FETCH_URL = f"{BASE_URL}{CATEGORY}/kvartiry/{CITY}/"
+FETCH_URL = f"{BASE_URL}/{CATEGORY}/kvartiry/{CITY}/"
 
 LIST_OUTPUT_CSV = paths.data_path("krisha_astana_ids.csv")
 LIST_PROGRESS_FILE = paths.data_path("progress_list.json")
@@ -63,9 +72,11 @@ LIST_PROGRESS_FILE = paths.data_path("progress_list.json")
 # master_db.mark_missing.
 LIST_META_FILE = paths.data_path("list_meta.json")
 
-# Детальная таблица теперь в SQLite (master_db.DB_PATH), а не в CSV.
-# Отдельный progress_detail.json больше не нужен: скачанная карточка сразу
-# лежит в базе, поэтому прогресс прогона — это сама база.
+# Куки общие для full scan и fast track: для сайта сборщик — один посетитель.
+COOKIES_FILE = paths.data_path("krisha_cookies.json")
+
+# Ответ сайта, на котором full scan прервался (блокировка/смена разметки).
+BLOCKED_SAMPLE = paths.data_path("full_blocked_last.html")
 
 # Через сколько скачанных карточек сбрасывать их в базу одной транзакцией.
 # Компромисс между "потерять при обрыве" и "не дёргать диск на каждый id".
@@ -76,25 +87,12 @@ MAX_PAGES = None
 
 # Возраст снимка списка (list_meta.json), после которого его больше не
 # считаем свежим для права помечать missing — см. run_detail_stage.
-#
-# БАГ, КОТОРЫЙ ЭТО ЧИНИТ: константа использовалась в run_detail_stage,
-# но никогда не была объявлена — NameError при каждом FULL SCAN,
-# начиная с той версии, где появилась проверка свежести снимка.
-# Обход падал на уровне 2 ПОСЛЕ того, как уровень 1 честно доходил до
-# конца (в логе видно: "Уровень 1 завершён ПОЛНОСТЬЮ" — 163/163
-# страницы, 3143 id), то есть терялась вся уже проделанная работа
-# уровня 1 на каждом цикле, а orchestrator.run_task ставил повтор
-# через 15 минут — и падал точно так же снова. Обход НИ РАЗУ не
-# доходил до карточек с момента, когда это было задеплоено.
-#
-# Значение — 1.5 интервала полного обхода (совпадает по духу с
-# MISSING_GRACE_SECONDS в master_db.py: один пропуск прощается).
+# 1.5 интервала полного обхода (совпадает по духу с MISSING_GRACE_SECONDS
+# в master_db.py: один пропуск прощается).
 LIST_SNAPSHOT_MAX_AGE_S = float(os.environ.get("LIST_SNAPSHOT_MAX_AGE_S", str(9 * 3600)))
 
-# Пауза между запросами страниц списка (сек)
-# Пауза между страницами списка. Тоже через env — уровень 1 шёл
-# 163 страницы подряд и был первой половиной того профиля, на котором
-# сработала блокировка.
+# Пауза между страницами списка. Через env — уровень 1 шёл 163 страницы
+# подряд и был первой половиной того профиля, на котором сработала блокировка.
 DELAY_MIN = float(os.environ.get("LIST_DELAY_MIN", "3.0"))
 DELAY_MAX = float(os.environ.get("LIST_DELAY_MAX", "6.0"))
 
@@ -103,104 +101,160 @@ DELAY_MAX = float(os.environ.get("LIST_DELAY_MAX", "6.0"))
 # УВЕЛИЧЕНО ПОСЛЕ БАНА. Прошлые 1-2с давали ~40 запросов в минуту, и
 # обход шёл почти полчаса подряд без единого перерыва: 163 страницы
 # списка, сразу за ними сотни карточек. Именно на этом профиле krisha
-# начала отвечать кодом 468 — блокировка сработала по частоте, а не по
-# IP (проверено: после паузы одиночный запрос с того же адреса Render
-# вернул 200, то есть датацентровые адреса сами по себе не забанены).
+# начала отвечать кодом 468. 3-6с дают ~13 запросов в минуту — втрое
+# мягче. После первого полного обхода карточки нужны только НОВЫМ
+# объявлениям (~150 в сутки), известные обновляются ценой из списка.
 #
-# 3-6с дают ~13 запросов в минуту — втрое мягче. Первый полный обход
-# станет дольше, но он разовый: после него детальные карточки нужны
-# только НОВЫМ объявлениям (~150 в сутки по замеру), а известные
-# обновляются ценой со страницы списка, без захода в карточку.
-#
-# Через переменные окружения — чтобы подкручивать на проде без
-# передеплоя, если 468 вернётся.
+# Через переменные окружения — чтобы подкручивать на проде без передеплоя.
 DETAIL_DELAY_MIN = float(os.environ.get("DETAIL_DELAY_MIN", "3.0"))
 DETAIL_DELAY_MAX = float(os.environ.get("DETAIL_DELAY_MAX", "6.0"))
 
-# Сколько карточек качаем ОДНОВРЕМЕННО.
-# ВРЕМЕННО ВОЗВРАЩЕНО В 1 (строго последовательно, как было до ускорения) —
-# после бана по IP от Krisha.kz. Разгонять обратно только постепенно и
-# только когда убедишься, что блокировка снята и какое-то время всё стабильно.
+# Сколько карточек качаем ОДНОВРЕМЕННО. 1 (строго последовательно) — после
+# бана по IP. Разгонять только постепенно и только когда блокировка снята
+# и какое-то время всё стабильно.
 DETAIL_CONCURRENCY = int(os.environ.get("DETAIL_CONCURRENCY", "1"))
 
-# "Выключатель" на случай, если сайт всё же начал банить/капчить: если подряд
-# провалилось много запросов ЛЮБЫХ воркеров — это не "сеть моргнула", это
-# похоже на блокировку. Останавливаемся и делаем длинную паузу вместо того,
-# чтобы долбить дальше и усугублять бан.
+# "Выключатель" на СЕТЕВЫЕ провалы (таймауты, 5xx): если подряд провалилось
+# много запросов, делаем длинную паузу вместо того, чтобы долбить дальше.
+# Осознанный отказ сайта (4xx, SafeLine) брейкер не ждёт — прерывает прогон
+# сразу (BlockedError).
 CIRCUIT_BREAKER_FAILURES = 8
 CIRCUIT_BREAKER_COOLDOWN = 180.0
 
 # Сколько раз брейкер может сработать за один обход, прежде чем признать,
-# что нас просто не пускают, и прекратить обход. Без этого сервис
-# бесконечно чередовал бы "8 провалов -> пауза 180с -> 8 провалов",
-# усугубляя блокировку и не продвигаясь ни на шаг.
+# что сеть не пускает, и прекратить уровень 2.
 MAX_BREAKER_TRIPS = int(os.environ.get("MAX_BREAKER_TRIPS", "3"))
 
+REQUEST_TIMEOUT = 20
 MAX_RETRIES = 3
-
-# Коды, при которых сайт отказывает осознанно, а не случайно.
-# 468 — нестандартный код, которым krisha.kz отвечает при блокировке
-# (наблюдался в проде: все карточки подряд отдавали 468, при том что
-# страницы списка до этого качались нормально).
-BLOCKING_STATUSES = {403, 429, 468, 503}
 RETRY_BASE_DELAY = 5.0
 
-# TTL/needs_fetch больше нет — парсер тупой исполнитель, качает ВСЕ id из
-# списка каждый прогон. Кого качать (приоритеты, "не чаще раза в N часов")
-# при необходимости решает вызывающая сторона (оркестратор), не парсер.
+# Столько карточек подряд без данных объявления (и без антибота) — значит,
+# сменилась разметка; дальше качать впустую не стоит.
+MAX_CONSECUTIVE_BAD_CARDS = 3
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36"
-    ),
-    "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
-    # Остальные заголовки — как их шлёт настоящий Chrome. Сами по себе
-    # они проблему 468 не объясняют (на списке хватало и двух), но
-    # приближают запрос к браузерному без каких-либо издержек.
-    "Accept": ("text/html,application/xhtml+xml,application/xml;q=0.9,"
-               "image/avif,image/webp,*/*;q=0.8"),
-    # Accept-Encoding НЕ задаём вручную.
-    #
-    # Я пробовал прописать "gzip, deflate, br" — и сломал этим ВЕСЬ
-    # обход: сервер начал отвечать brotli, а пакета brotli/brotlicffi
-    # в контейнере нет, поэтому aiohttp падал с ClientResponseError на
-    # каждом запросе, включая страницы списка, которые до этого
-    # работали. Обещать в заголовке то, что клиент не умеет
-    # распаковывать, нельзя.
-    #
-    # aiohttp сам подставляет Accept-Encoding ровно с теми кодировками,
-    # которые реально может декодировать. Это и правильнее, и
-    # безопаснее ручного списка.
-    "Upgrade-Insecure-Requests": "1",
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "none",
-    "Connection": "keep-alive",
-}
+# Самый свежий профиль Chrome из поддерживаемых curl_cffi: живой Chrome
+# автообновляется, и старая мажорная версия сама по себе выделяется.
+IMPERSONATE = "chrome150"
 
+# User-Agent, Accept, Sec-* и Accept-Encoding ставит сам curl_cffi под
+# выбранный профиль — ручные значения только разошлись бы с TLS-отпечатком.
+HEADERS = {"Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8"}
 
-def _new_session():
-    """Свежая сессия БЕЗ хранилища куки.
+# Порядок заголовков как у Chrome. Без него curl_cffi ставит cookie первым,
+# а referer — первым или последним; антиботы проверяют порядок.
+HEADER_ORDER = ",".join([
+    "sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform",
+    "upgrade-insecure-requests", "user-agent", "accept",
+    "sec-fetch-site", "sec-fetch-mode", "sec-fetch-user", "sec-fetch-dest",
+    "referer", "accept-encoding", "accept-language", "cookie", "priority",
+])
 
-    DummyCookieJar означает: полученные Set-Cookie не сохраняются и не
-    отправляются обратно. Именно накопленная за 169 запросов кука —
-    главный подозреваемый в том, что карточки стали отдавать 468, тогда
-    как одиночный curl без куки с того же IP получает 200.
-    """
-    return aiohttp.ClientSession(
-        headers=HEADERS,
-        cookie_jar=aiohttp.DummyCookieJar(),
-    )
+NOT_FOUND_STATUSES = {404, 410}
+SAFELINE_MARKER = "/.safeline/"
+
+EXIT_OK = 0
+EXIT_BLOCKED = 2
+EXIT_LAYOUT_CHANGED = 3
+EXIT_NO_PAGES = 4
 
 LIST_FIELDNAMES = ["id", "url", "price", "page_number", "scraped_at"]
 
 # Единый набор колонок — задаётся в master_db.py, т.к. и fast track, и full
-# scan пишут в одну и ту же таблицу и должны использовать одну и ту же схему
-# (включая служебные first_seen_at/last_seen_at/status).
+# scan пишут в одну и ту же таблицу и должны использовать одну и ту же схему.
 DETAIL_FIELDNAMES = master_db.DETAIL_FIELDNAMES
 
-# ============================== ОБЩИЕ ХЕЛПЕРЫ ==============================
+# ============================== СЕТЬ ==============================
+
+
+class AbortRun(Exception):
+    """Прогон нужно прервать: сайт отказал осознанно или сменилась разметка."""
+
+    exit_code = None
+
+    def __init__(self, reason, resp):
+        super().__init__(reason)
+        self.resp = resp
+
+
+class BlockedError(AbortRun):
+    exit_code = EXIT_BLOCKED
+
+
+class LayoutChangedError(AbortRun):
+    exit_code = EXIT_LAYOUT_CHANGED
+
+
+def page_url(page_num):
+    # Браузер открывает первую страницу без ?page=1.
+    return FETCH_URL if page_num == 1 else f"{FETCH_URL}?page={page_num}"
+
+
+def advert_url(advert_id):
+    return f"{BASE_URL}/a/show/{advert_id}"
+
+
+def is_antibot_page(resp):
+    return SAFELINE_MARKER in resp.text
+
+
+def _new_session(cookies_path=COOKIES_FILE):
+    """Сессия с отпечатком Chrome и куками прошлых прогонов."""
+    session = AsyncSession(
+        headers=HEADERS,
+        impersonate=IMPERSONATE,
+        curl_options={CurlOpt.HTTPHEADER_ORDER: HEADER_ORDER},
+    )
+    load_cookies(session, cookies_path)
+    return session
+
+
+async def fetch_url(session, url, referer=None):
+    """GET с ретраями.
+
+    Возвращает Response при 200; None — если страницы нет (404/410) или сеть
+    не отдала её за MAX_RETRIES попыток. На любой другой 4xx сразу бросает
+    BlockedError: повтор под антиботом только портит репутацию IP (SafeLine
+    на krisha.kz отвечает нестандартным 468).
+
+    referer — переход по ссылке внутри сайта; без него запрос выглядит как
+    ввод адреса вручную (sec-fetch-site: none).
+    """
+    headers = {"Referer": referer, "Sec-Fetch-Site": "same-origin"} if referer else None
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            resp = await session.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+        except CurlRequestError as e:
+            print(f"   ⚠️  {url}: ошибка {e!r} (попытка {attempt}/{MAX_RETRIES})")
+        else:
+            if resp.status_code == 200:
+                return resp
+            if resp.status_code in NOT_FOUND_STATUSES:
+                print(f"   ⏭️  {url}: {resp.status_code}, страницы нет")
+                return None
+            if 400 <= resp.status_code < 500:
+                raise BlockedError(f"HTTP {resp.status_code} на {url}", resp)
+            print(f"   ⚠️  {url}: статус {resp.status_code} (попытка {attempt}/{MAX_RETRIES})")
+
+        if attempt < MAX_RETRIES:
+            await asyncio.sleep(RETRY_BASE_DELAY * attempt)
+
+    print(f"   ❌ {url}: не удалось загрузить после {MAX_RETRIES} попыток")
+    return None
+
+
+async def gather_workers(workers):
+    """gather, который при падении одного воркера гасит остальных и ждёт их."""
+    try:
+        await asyncio.gather(*workers)
+    except BaseException:
+        for w in workers:
+            w.cancel()
+        await asyncio.gather(*workers, return_exceptions=True)
+        raise
+
+
+# ============================== ФАЙЛЫ ==============================
 
 
 def load_progress(path):
@@ -218,46 +272,78 @@ def save_progress(path, data):
         json.dump(data, f, ensure_ascii=False)
 
 
-async def fetch_url(session, url, params=None):
-    """Общий загрузчик с ретраями. Возвращает HTML или None.
+def save_json_atomic(path, data):
+    tmp_path = path + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_path, path)
 
-    На кодах блокировки ретраи НЕ делаются. Смысл ретрая — пережить
-    случайный сбой; если сайт осознанно отказал (429, 403, 503 или
-    нестандартный 468, которым krisha отвечает при блокировке), то три
-    попытки подряд ничего не починят, а только добавят запросов в
-    момент, когда нас и так уже не пускают. Возвращаем None сразу,
-    брейкер уровнем выше посчитает это провалом и уйдёт в паузу.
-    """
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            async with session.get(
-                url, params=params, timeout=aiohttp.ClientTimeout(total=20)
-            ) as resp:
-                if resp.status == 200:
-                    return await resp.text()
-                if resp.status in BLOCKING_STATUSES:
-                    print(f"   🚫 {url}: статус {resp.status} — блокировка, "
-                          f"ретраи не помогут")
-                    return None
-                print(f"   ⚠️  {url}: статус {resp.status} (попытка {attempt}/{MAX_RETRIES})")
-        except Exception as e:
-            print(f"   ⚠️  {url}: ошибка {e!r} (попытка {attempt}/{MAX_RETRIES})")
 
-        if attempt < MAX_RETRIES:
-            backoff = RETRY_BASE_DELAY * attempt
-            await asyncio.sleep(backoff)
+def load_cookies(session, path=COOKIES_FILE):
+    if not os.path.exists(path):
+        return
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            saved = json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        print(f"⚠️  {path} не читается ({e}), стартую с чистыми куками.")
+        return
+    now = time.time()
+    for c in saved:
+        if c["expires"] is not None and c["expires"] <= now:
+            continue
+        session.cookies.jar.set_cookie(http.cookiejar.Cookie(
+            version=0, name=c["name"], value=c["value"],
+            port=None, port_specified=False,
+            domain=c["domain"], domain_specified=True,
+            domain_initial_dot=c["domain"].startswith("."),
+            path=c["path"], path_specified=True,
+            secure=c["secure"], expires=c["expires"], discard=False,
+            comment=None, comment_url=None, rest={},
+        ))
 
-    print(f"   ❌ {url}: не удалось загрузить после {MAX_RETRIES} попыток")
-    return None
+
+def save_cookies(session, path=COOKIES_FILE):
+    save_json_atomic(path, [
+        {"name": c.name, "value": c.value, "domain": c.domain,
+         "path": c.path, "secure": c.secure, "expires": c.expires}
+        for c in session.cookies.jar
+    ])
+
+
+def burn_cookies(session, path=COOKIES_FILE):
+    """SafeLine узнаёт посетителя по кукам даже с другого IP — после блокировки
+    они только вредят. Чистим и файл, и сессию: оркестратор держит её дальше."""
+    session.cookies.clear()
+    if os.path.exists(path):
+        os.remove(path)
+    print(f"🍪 {path} удалён — следующий прогон начнётся с чистыми куками.")
+
+
+def save_response_sample(path, err):
+    resp = err.resp
+    headers = "\n".join(f"{k}: {v}" for k, v in resp.headers.multi_items())
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(f"<!--\nreason: {err}\nurl: {resp.url}\nstatus: {resp.status_code}\n{headers}\n-->\n")
+        f.write(resp.text)
+
+
+def handle_abort(session, err, sample_path, cookies_path=COOKIES_FILE):
+    """Сохраняет ответ сайта; при блокировке сжигает куки."""
+    save_response_sample(sample_path, err)
+    print(f"🛑 {err}. Прогон прерван (код {err.exit_code}), ответ сайта — в {sample_path}.")
+    if isinstance(err, BlockedError):
+        burn_cookies(session, cookies_path)
 
 
 # ============================== УРОВЕНЬ 1: СПИСОК ==============================
 
 
 def parse_card_price(card):
-    """Цена прямо из карточки списка (.a-card__price) — тот же приём, что в
-    fast track. Не идеально надёжно (вдруг вёрстка изменится), но избавляет
-    от похода в карточку ради одной только цены уже известных id."""
+    """Цена прямо из карточки списка (.a-card__price) — избавляет от похода в
+    карточку ради одной только цены уже известных id."""
     price_el = card.select_one(".a-card__price")
     if not price_el:
         return None
@@ -266,25 +352,20 @@ def parse_card_price(card):
 
 
 def parse_listing_page(html, page_num):
-    """ID, URL и цена — цена нужна, чтобы для уже известных id вообще не
-    ходить в карточку (см. run_detail_stage). Остальные поля (площадь,
-    фото, описание и т.п.) всё ещё надёжнее брать с карточки (Уровень 2),
-    но это делаем только для НОВЫХ id.
+    """{id: row} со страницы списка: id, url, цена, номер страницы.
 
-    Возвращает {id: row}. Это ЕДИНСТВЕННАЯ реализация разбора страницы
-    списка на всю систему — fast track импортирует её отсюда же. Раньше у
-    него была своя копия, и при первом же изменении вёрстки эти две копии
-    разъехались бы молча."""
+    Это ЕДИНСТВЕННАЯ реализация разбора страницы списка на всю систему —
+    fast track импортирует её отсюда же. Номер страницы нужен как Referer
+    при переходе в карточку."""
     soup = BeautifulSoup(html, "html.parser")
-    cards = soup.select("div.a-card[data-id]")
     rows = {}
-    for card in cards:
+    for card in soup.select("div.a-card[data-id]"):
         advert_id = card.get("data-id")
         if not advert_id:
             continue
         rows[advert_id] = {
             "id": advert_id,
-            "url": f"https://krisha.kz/a/show/{advert_id}",
+            "url": advert_url(advert_id),
             "price": parse_card_price(card),
             "page_number": page_num,
             "scraped_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -295,20 +376,10 @@ def parse_listing_page(html, page_num):
 def get_total_pages_from_html(html):
     """Возвращает число страниц или None, если распознать не удалось.
 
-    РАНЬШЕ ЗДЕСЬ БЫЛ return 1 — И В except, И В КОНЦЕ ФУНКЦИИ, ЕСЛИ
-    ПАТТЕРН НЕ НАШЁЛСЯ ВООБЩЕ. Это тихая порча данных страшнее краша:
-    смена вёрстки, капча вместо списка или временный сбой на стороне
-    krisha выдают HTML без digitalData — и вместо явной ошибки функция
-    молча говорила "страница одна". run_list_stage считал обход
-    завершённым после первой же страницы, list_meta.json получал
-    complete=true, и всё, что не попало на страницу 1 (то есть
-    практически вся база), на следующем full scan уходило в missing.
-    Никакого WARNING, никакого исключения — только правдоподобный, но
-    неверный результат.
-
-    Теперь: None здесь — сигнал "не разобрал", и вызывающий код обязан
-    трактовать это так же, как недоступность первой страницы (см.
-    run_list_stage) — снимок помечается aborted, а не complete.
+    РАНЬШЕ ЗДЕСЬ БЫЛ return 1, если паттерн не нашёлся. Смена вёрстки или
+    капча вместо списка молча превращались в "страница одна": обход
+    считался полным после первой же страницы, и на следующем full scan
+    практически вся база уходила в missing. None — сигнал "не разобрал".
     """
     soup = BeautifulSoup(html, "html.parser")
     for script in soup.find_all("script"):
@@ -324,24 +395,32 @@ def get_total_pages_from_html(html):
     return None
 
 
+def _mark_list_aborted(reason):
+    # Без этого list_meta.json оставался бы от ПРОШЛОГО успешного прогона с
+    # complete=true, и уровень 2 помечал бы missing по устаревшему снимку.
+    save_progress(LIST_META_FILE, {
+        "complete": False,
+        "aborted": True,
+        "reason": reason,
+        "finished_at": master_db.utcnow_iso(),
+    })
+
+
 async def run_list_stage(session):
     """
-    ВАЖНО: этот метод рассчитан на регулярный повторный вызов (из оркестратора,
-    раз в час и т.п.) — каждый раз он заново обходит ВСЕ страницы списка,
-    чтобы поймать и новые объявления, и те, что успели пропасть.
+    Обходит ВСЕ страницы списка заново при каждом вызове — чтобы поймать и
+    новые объявления, и те, что успели пропасть.
 
-    progress_list.json здесь нужен ТОЛЬКО для восстановления после обрыва
-    сети/падения процесса ВНУТРИ одного прогона — если прошлый прогон
-    завершился штатно (run_finished=True), прогресс сбрасывается и
-    сканирование стартует с первой страницы заново. Раньше progress
-    накапливался НАВСЕГДА между прогонами, из-за чего после первого же
-    успешного запуска все последующие ничего не находили — это и есть
-    баг №1, о котором шла речь.
+    progress_list.json нужен ТОЛЬКО для восстановления после обрыва ВНУТРИ
+    одного прогона (падение процесса, блокировка): следующий вызов продолжит
+    с того места. Если прошлый прогон завершился штатно (run_finished=True),
+    прогресс сбрасывается и сканирование стартует с первой страницы.
 
-    Список пишется как ЦЕЛЬНЫЙ СНЕПШОТ (перезаписывается), а не аппендится
-    бесконечно: LIST_OUTPUT_CSV = "что видно на сайте прямо сейчас", а не
-    журнал за всё время (этот файл — вход для отдельного slow-track
-    монитора удешевления, у которого свой price_state.json).
+    Список пишется как ЦЕЛЬНЫЙ СНЕПШОТ (перезаписывается), а не аппендится:
+    LIST_OUTPUT_CSV = "что видно на сайте прямо сейчас".
+
+    Возвращает {id: row}, или None, если не загрузилась даже первая страница.
+    Блокировка/смена разметки — AbortRun (снимок помечается неполным).
     """
     print(f"=== Уровень 1: список ({FETCH_URL}) ===")
 
@@ -352,48 +431,40 @@ async def run_list_stage(session):
     else:
         print(f"↪️  Обнаружен незавершённый прошлый прогон, продолжаю с этого места (по {LIST_PROGRESS_FILE})")
 
+    try:
+        return await _walk_list(session, progress)
+    except AbortRun as e:
+        _mark_list_aborted(str(e))
+        raise
+
+
+def _raise_for_empty_list_page(resp, page_num):
+    if is_antibot_page(resp):
+        raise BlockedError(f"страница {page_num}: антибот SafeLine", resp)
+    raise LayoutChangedError(f"страница {page_num}: нет карточек", resp)
+
+
+async def _walk_list(session, progress):
     start_page = progress.get("last_completed_page", 0) + 1
 
     print("Запрашиваю первую страницу, чтобы узнать общее число страниц...")
-    first_html = await fetch_url(session, FETCH_URL, params={"page": 1})
-    if first_html is None:
+    first = await fetch_url(session, page_url(1))
+    if first is None:
         print("Не удалось получить даже первую страницу. Прерываю уровень 1.")
-        # ВАЖНО: помечаем снимок неполным. Раньше здесь был голый
-        # return {}, и list_meta.json оставался от ПРОШЛОГО успешного
-        # прогона с complete=true. Уровень 2 читал старый CSV (мог быть
-        # многодневной давности), считал снимок полным и: воскрешал
-        # снятые объявления как active, а всё появившееся на сайте за
-        # это время помечал missing. Одна минута недоступности сайта
-        # приводила к массовой порче базы, без единого WARNING.
-        save_progress(LIST_META_FILE, {
-            "complete": False,
-            "aborted": True,
-            "reason": "первая страница списка недоступна",
-            "finished_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        })
-        return {}
+        _mark_list_aborted("первая страница списка недоступна")
+        return None
 
-    total_pages = get_total_pages_from_html(first_html)
+    total_pages = get_total_pages_from_html(first.text)
     if total_pages is None:
-        print("❌ Не удалось распознать число страниц из HTML "
-              "(смена вёрстки? капча? пустая страница?). Прерываю уровень 1.")
-        # Тот же принцип, что при недоступности первой страницы выше:
-        # снимок неполный, помечаем честно, а не притворяемся, что
-        # страница одна.
-        save_progress(LIST_META_FILE, {
-            "complete": False,
-            "aborted": True,
-            "reason": "не удалось распознать pagesCount из HTML",
-            "finished_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        })
-        return {}
+        if is_antibot_page(first):
+            raise BlockedError("страница 1: антибот SafeLine", first)
+        raise LayoutChangedError("страница 1: не распознано число страниц (pagesCount)", first)
     if MAX_PAGES:
         total_pages = min(total_pages, MAX_PAGES)
     print(f"✅ Всего страниц: {total_pages}")
 
-    # id -> row. Собираем в памяти и пишем файл целиком в конце (+ подхватываем
-    # то, что уже успело сохраниться в этом прогоне, если это восстановление
-    # после обрыва).
+    # id -> row. При восстановлении после обрыва подхватываем то, что уже
+    # успело сохраниться в этом прогоне.
     collected = {}
     if start_page > 1 and os.path.exists(LIST_OUTPUT_CSV):
         with open(LIST_OUTPUT_CSV, "r", encoding="utf-8-sig") as f:
@@ -406,25 +477,40 @@ async def run_list_stage(session):
     skipped_pages = list(progress.get("skipped_pages", []))
 
     if start_page == 1:
-        rows = parse_listing_page(first_html, 1)
+        rows = parse_listing_page(first.text, 1)
+        if not rows:
+            _raise_for_empty_list_page(first, 1)
         collected.update(rows)
         print(f"   📄 Страница 1: найдено {len(rows)} ID")
+        # Сразу на диск: иначе обрыв на странице 2 оставил бы CSV прошлого
+        # прогона, и восстановление приняло бы его устаревшие id за свежие.
+        _write_list_csv(collected)
         progress["last_completed_page"] = 1
         save_progress(LIST_PROGRESS_FILE, progress)
         start_page = 2
 
     for page_num in range(start_page, total_pages + 1):
-        html = await fetch_url(session, FETCH_URL, params={"page": page_num})
-        if html is not None:
-            rows = parse_listing_page(html, page_num)
+        resp = await fetch_url(session, page_url(page_num), referer=page_url(page_num - 1))
+        if resp is None:
+            print(f"   ⏭️  Страница {page_num} пропущена из-за ошибок сети")
+            skipped_pages.append(page_num)
+        else:
+            rows = parse_listing_page(resp.text, page_num)
+            if not rows:
+                # Пока идёт обход, объявления снимают, и хвост списка может
+                # опустеть. Это конец списка, только если сама страница
+                # говорит, что страниц теперь меньше.
+                current_total = None if is_antibot_page(resp) else get_total_pages_from_html(resp.text)
+                if current_total is None or current_total >= page_num:
+                    _raise_for_empty_list_page(resp, page_num)
+                print(f"   ↪️  Страница {page_num} пуста: страниц стало {current_total}, список закончился")
+                progress["last_completed_page"] = page_num
+                save_progress(LIST_PROGRESS_FILE, progress)
+                break
             collected.update(rows)
             print(f"   📄 Страница {page_num}/{total_pages}: найдено {len(rows)} ID")
             progress["last_completed_page"] = page_num
-            # промежуточно сохраняем снепшот, чтобы не потерять данные при обрыве
             _write_list_csv(collected)
-        else:
-            print(f"   ⏭️  Страница {page_num} пропущена из-за ошибок сети")
-            skipped_pages.append(page_num)
         progress["skipped_pages"] = skipped_pages
         save_progress(LIST_PROGRESS_FILE, progress)
 
@@ -460,12 +546,9 @@ async def run_list_stage(session):
 
 
 def _write_list_csv(rows_by_id):
-    # Через .tmp + os.replace, как save_state/save_known_ids. Раньше был
-    # прямой open("w"), который усекает файл мгновенно: файл на 3000
-    # строк переписывается на каждой из ~150 страниц, и SIGKILL в этот
-    # момент оставлял CSV, обрезанный на случайной строке. Следующий
-    # запуск дочитывал оставшиеся страницы, skipped_pages оставался
-    # пустым, снимок объявлялся полным — и mark_missing выкашивал всё,
+    # Через .tmp + os.replace: прямой open("w") усекает файл мгновенно, и
+    # SIGKILL посреди записи оставлял CSV, обрезанный на случайной строке —
+    # восстановление объявляло снимок полным, и mark_missing выкашивал всё,
     # что было в потерянном куске.
     tmp = LIST_OUTPUT_CSV + ".tmp"
     with open(tmp, "w", encoding="utf-8-sig", newline="") as f:
@@ -565,7 +648,7 @@ def parse_detail_page(html, advert_id):
 
     return {
         "id": advert_id,
-        "url": f"https://krisha.kz/a/show/{advert_id}",
+        "url": advert_url(advert_id),
         "title": advert.get("title"),
         "price": advert.get("price") or (int(price_text) if price_text else None),
         "price_m2_text": advert_extra.get("priceM2Text"),
@@ -606,20 +689,31 @@ def parse_detail_page(html, advert_id):
     }
 
 
-# Работа с таблицей — только через master_db (SQLite). Снимок всей
-# таблицы в память больше не грузится: каждая скачанная карточка пишется
-# точечным upsert'ом по id. Раньше воркеры правили общий dict, а он
-# периодически выгружался в CSV целиком — и этот "свой" снимок затирал
-# всё, что успел записать fast track за часы полного обхода.
+def parse_card(resp, advert_id):
+    """Строка карточки или None, если данных объявления нет. Антибот — BlockedError."""
+    if not (extract_window_data(resp.text) or {}).get("advert"):
+        if is_antibot_page(resp):
+            raise BlockedError(f"карточка {advert_id}: антибот SafeLine", resp)
+        print(f"   ⚠️  {advert_id}: в карточке нет данных объявления")
+        return None
+    try:
+        return parse_detail_page(resp.text, advert_id)
+    except Exception as e:
+        # Одна "кривая" карточка не должна ронять прогон.
+        print(f"   ⚠️  {advert_id}: не удалось разобрать карточку ({e!r})")
+        return None
+
+
+# Работа с таблицей — только через master_db (SQLite): каждая скачанная
+# карточка пишется точечным upsert'ом по id, поэтому параллельные правки
+# fast track не затираются.
 
 
 async def _detail_worker(queue, session, state):
     """
     Один воркер из пула DETAIL_CONCURRENCY. Берёт ID из общей очереди,
-    качает карточку и сразу пишет её в базу — точечно, только свой id.
-    Свою "человеческую" задержку выдерживает между СВОИМИ запросами, так
-    что при N воркерах скорость растёт в N раз, а каждый отдельный воркер
-    по-прежнему не долбит сайт без пауз.
+    качает карточку и копит её для записи в базу. Свою "человеческую"
+    задержку выдерживает между СВОИМИ запросами.
     """
     while True:
         try:
@@ -627,81 +721,60 @@ async def _detail_worker(queue, session, state):
         except asyncio.QueueEmpty:
             return
 
-        # circuit breaker: если сайт похоже начал банить/капчить — не долбим дальше
         async with state["lock"]:
-            if state.get("abort"):
-                # Обход признан безнадёжным (см. MAX_BREAKER_TRIPS) —
-                # воркер выходит, не трогая очередь.
-                queue.task_done()
+            if state["abort"]:
                 return
-            if state["breaker_until"] and datetime.now(timezone.utc) < state["breaker_until"]:
-                cooldown = (state["breaker_until"] - datetime.now(timezone.utc)).total_seconds()
-            else:
-                cooldown = 0
+            now = datetime.now(timezone.utc)
+            breaker_until = state["breaker_until"]
+            cooldown = (breaker_until - now).total_seconds() if breaker_until and now < breaker_until else 0
         if cooldown > 0:
             await asyncio.sleep(cooldown)
 
-        url = f"https://krisha.kz/a/show/{advert_id}"
-        html = await fetch_url(session, url)
+        resp = await fetch_url(session, advert_url(advert_id), referer=state["referers"].get(advert_id))
+        row = parse_card(resp, advert_id) if resp is not None else None
 
         async with state["lock"]:
-            if html is None:
-                print(f"   ⏭️  ID {advert_id} пропущен из-за ошибок сети")
-                # ВАЖНО: сетевой отказ НЕ записывается в fetch_failures.
-                #
-                # Раньше писался наравне с "карточка неполная", а там
-                # после MAX_FETCH_ATTEMPTS (4) id навсегда выбывает из
-                # очереди на перекачку. При бане/блокировке по IP
-                # (krisha отвечает нестандартным статусом 468) подряд
-                # валятся ВСЕ запросы — и за 4 прогона весь текущий
-                # список объявлений оказался бы вычеркнут необратимо,
-                # уже после снятия бана.
-                #
-                # Разница принципиальная: "страница отдалась, но в ней
-                # нет данных" — это свойство объявления, его честно
-                # считать. "До страницы не достучались" — это свойство
-                # СЕТИ в данный момент, и объявление тут ни при чём.
-                # Такие id просто останутся неполными и попадут в
-                # очередь на следующем прогоне.
+            if resp is None:
+                print(f"   ⏭️  ID {advert_id} пропущен (сеть или страницы нет)")
+                # Сетевой отказ НЕ записывается в fetch_failures: после
+                # MAX_FETCH_ATTEMPTS id навсегда выбывает из перекачки, а
+                # "не достучались" — свойство сети в данный момент, не
+                # объявления. Такие id вернутся в очередь следующим прогоном.
                 state["failed"] += 1
                 state["consecutive_failures"] += 1
                 if state["consecutive_failures"] >= CIRCUIT_BREAKER_FAILURES:
                     print(
-                        f"   🛑 {state['consecutive_failures']} провалов подряд — похоже на бан/капчу. "
+                        f"   🛑 {state['consecutive_failures']} сетевых провалов подряд. "
                         f"Пауза {CIRCUIT_BREAKER_COOLDOWN:.0f}с для всех воркеров."
                     )
                     state["breaker_until"] = datetime.now(timezone.utc) + timedelta(
                         seconds=CIRCUIT_BREAKER_COOLDOWN
                     )
                     state["consecutive_failures"] = 0
-                    state["breaker_trips"] = state.get("breaker_trips", 0) + 1
-
-                    # Если брейкер срабатывает раз за разом, сайт нас не
-                    # пускает совсем. Продолжать долбиться бессмысленно и
-                    # вредно: мы только усугубляем блокировку. Выходим из
-                    # обхода, следующий цикл попробует заново.
+                    state["breaker_trips"] += 1
                     if state["breaker_trips"] >= MAX_BREAKER_TRIPS:
                         print(
                             f"   ⛔ Брейкер срабатывал {state['breaker_trips']} раз — "
-                            f"сайт стабильно не отдаёт карточки. Прерываю уровень 2, "
-                            f"чтобы не усугублять блокировку."
+                            f"сайт стабильно не отдаёт карточки. Прерываю уровень 2."
                         )
                         state["abort"] = True
             else:
                 state["consecutive_failures"] = 0
-                row = parse_detail_page(html, advert_id)
-
-                # Страница отдалась с кодом 200, но полезного в ней нет
-                # (капча, заглушка, изменившаяся вёрстка). Раньше такая
-                # пустая строка молча попадала в таблицу и больше никогда
-                # не перекачивалась — id-то "уже есть". Теперь она
-                # считается неудачной попыткой и вернётся в очередь на
-                # следующем прогоне (до MAX_FETCH_ATTEMPTS раз).
-                if not master_db.is_complete(row):
-                    print(f"   ⚠️  ID {advert_id}: карточка неполная (нет цены/комнат/площади), не засчитываю")
-                    _record_failure(state, advert_id, "incomplete")
+                if row is None or not master_db.is_complete(row):
+                    if row is not None:
+                        print(f"   ⚠️  ID {advert_id}: карточка неполная (нет цены/комнат/площади), не засчитываю")
+                    # Неудача засчитывается в fetch_failures, только когда
+                    # серия прервалась хорошей карточкой. Если серия дорастёт
+                    # до смены разметки, её id не должны терять попытки из-за
+                    # поломки на стороне сайта.
+                    state["bad_streak"].append((advert_id, "incomplete"))
                     state["failed"] += 1
+                    if len(state["bad_streak"]) >= MAX_CONSECUTIVE_BAD_CARDS:
+                        raise LayoutChangedError(
+                            f"{len(state['bad_streak'])} карточек подряд без данных объявления", resp)
                 else:
+                    state["failures"].extend(state["bad_streak"])
+                    state["bad_streak"] = []
                     state["fresh"][advert_id] = row
                     state["done"] += 1
 
@@ -716,15 +789,10 @@ async def _detail_worker(queue, session, state):
         await asyncio.sleep(random.uniform(DETAIL_DELAY_MIN, DETAIL_DELAY_MAX))
 
 
-def _record_failure(state, advert_id, reason):
-    state["failures"].append((advert_id, reason))
-
-
 def _flush(state):
     """
     Сбрасывает накопленные карточки и неудачи в базу одной транзакцией.
-    Пишутся ТОЛЬКО те id, которые этот прогон реально трогал, поэтому
-    параллельные правки fast track не теряются.
+    Пишутся ТОЛЬКО те id, которые этот прогон реально трогал.
     """
     if not state["fresh"] and not state["failures"]:
         return
@@ -738,33 +806,32 @@ def _flush(state):
     state["failures"] = []
 
 
+def _referer_for(row):
+    try:
+        return page_url(int(row.get("page_number")))
+    except (TypeError, ValueError):
+        return FETCH_URL
+
+
 async def run_detail_stage(session):
     """
     Уровень 2: полные карточки.
 
     КОГО КАЧАЕМ. Только тех, у кого полной карточки в базе ещё нет:
         - id из списка, которых в базе нет вообще (новые);
-        - id, которые в базе есть, но карточка НЕПОЛНАЯ (скачалась криво:
-          капча, обрыв, смена вёрстки). Без этого пункта одна неудачная
-          загрузка навсегда оставляла в базе строку-пустышку — id ведь
-          "уже есть", и повторно за ним никто не шёл. Попытки считаются,
+        - id, которые в базе есть, но карточка НЕПОЛНАЯ. Попытки считаются,
           после MAX_FETCH_ATTEMPTS объявление перестаёт мешаться.
-    Для всех остальных id полная карточка уже собрана и повторно не
-    качается: цена и так есть со страницы списка, а прочие поля (площадь,
-    фото, описание) практически не меняются — а именно они и нужны базе.
+    Известным полным id патчим только цену — прямо из list-скана, без
+    единого detail-запроса.
 
-    ЧТО ДЕЛАЕМ С ОСТАЛЬНЫМИ. Известным id патчим только цену — прямо из
-    list-скана (.a-card__price), без единого detail-запроса. Истории цены
-    не ведём: значение просто перезаписывается.
-
-    ВОССТАНОВЛЕНИЕ ПОСЛЕ ОБРЫВА. Отдельный progress-файл больше не нужен:
-    состояние прогресса — это сама база. Скачанная карточка сразу в ней
-    лежит, и при следующем запуске она уже не попадёт в очередь.
+    ВОССТАНОВЛЕНИЕ ПОСЛЕ ОБРЫВА. Состояние прогресса — это сама база:
+    скачанная карточка сразу в ней лежит и в очередь больше не попадёт.
 
     ПРОПАВШИЕ. Пометить объявление как missing имеет право только этот
-    прогон и только если обход списка прошёл БЕЗ пропущенных страниц
-    (см. LIST_META_FILE). Иначе упавшая по сети страница списка утащила
-    бы в missing десятки живых объявлений.
+    прогон и только если обход списка прошёл БЕЗ пропущенных страниц и
+    снимок свежий. Пометка зависит только от снимка списка, поэтому
+    выполняется и тогда, когда карточки прервала блокировка — иначе при
+    стабильном бане на карточках снятые объявления не помечались бы никогда.
     """
     print("=== Уровень 2: карточки объявлений (full scan) ===")
     if not os.path.exists(LIST_OUTPUT_CSV):
@@ -775,15 +842,13 @@ async def run_detail_stage(session):
         list_rows = list(csv.DictReader(f))
     list_ids = [row["id"] for row in list_rows]
     list_price_by_id = {row["id"]: row.get("price") for row in list_rows}
+    referers = {row["id"]: _referer_for(row) for row in list_rows}
 
     list_meta = load_progress(LIST_META_FILE)
     list_scan_complete = bool(list_meta.get("complete"))
 
-    # Снимок списка должен быть не только полным, но и СВЕЖИМ. Файл
-    # лежит на диске и переживает рестарты, поэтому "complete: true"
-    # мог остаться от обхода недельной давности — а по нему нельзя
-    # решать, что пропало с сайта. Если снимок старый, карточки качаем
-    # как обычно, но права помечать missing не даём.
+    # Снимок списка должен быть не только полным, но и СВЕЖИМ: "complete: true"
+    # мог остаться от обхода недельной давности.
     finished_at = list_meta.get("finished_at")
     if list_scan_complete and finished_at:
         try:
@@ -810,7 +875,6 @@ async def run_detail_stage(session):
 
         new_ids = [i for i in list_ids if i not in known]
         refetch_ids = [i for i in list_ids if i in refetch]
-        # Известные и полные — только патч цены, без запроса.
         price_only = {
             i: list_price_by_id.get(i)
             for i in list_ids
@@ -838,23 +902,31 @@ async def run_detail_stage(session):
 
     state = {
         "lock": asyncio.Lock(),
+        "referers": referers,
         "fresh": {},
         "failures": [],
+        "bad_streak": [],
         "done": 0,
         "failed": 0,
         "written": 0,
         "total": len(todo_ids),
         "consecutive_failures": 0,
         "breaker_until": None,
+        "breaker_trips": 0,
+        "abort": False,
     }
 
     workers = [
         asyncio.create_task(_detail_worker(queue, session, state))
-        for _ in range(min(DETAIL_CONCURRENCY, max(1, len(todo_ids))))
+        for _ in range(min(DETAIL_CONCURRENCY, len(todo_ids)))
     ]
+    aborted = None
     try:
         if workers:
-            await asyncio.gather(*workers)
+            await gather_workers(workers)
+        state["failures"].extend(state["bad_streak"])
+    except AbortRun as e:
+        aborted = e
     finally:
         # Даже при падении/Ctrl+C то, что уже скачали, не теряется.
         _flush(state)
@@ -872,7 +944,8 @@ async def run_detail_stage(session):
         )
 
     print(
-        f"🎉 Уровень 2 завершён. Новых карточек записано: {state['written']}, "
+        f"{'⛔ Уровень 2 прерван' if aborted else '🎉 Уровень 2 завершён'}. "
+        f"Новых карточек записано: {state['written']}, "
         f"брак/недокачано: {state['failed']}, "
         f"цена обновлена без запросов: {patched}, "
         f"впервые помечено missing: {missing}"
@@ -881,67 +954,65 @@ async def run_detail_stage(session):
         f"📊 База: всего {s['total']}, active {s['active']}, missing {s['missing']}, "
         f"полных карточек {s['complete']}"
     )
+    if aborted:
+        raise aborted
     return s
-
-
 
 
 # ============================== MAIN / ОРКЕСТРАЦИЯ ==============================
 
 
-async def run_cycle(stage="all", session=None):
+async def run_cycle(stage="all", session=None, cookies_path=COOKIES_FILE):
     """
-    Точка входа для оркестратора. Один вызов = один цикл сбора (то, что раньше
-    называлось "один запуск скрипта"), но теперь его безопасно вызывать снова
-    и снова — список и карточки перекачиваются целиком каждый раз, без
-    собственной памяти парсера о том, что уже видели. Если нужно качать не
-    всё, а по приоритету/TTL — эта логика теперь на стороне оркестратора,
-    который решает, какие id вообще передать/запросить.
+    Точка входа для оркестратора. Один вызов = один цикл сбора; безопасно
+    вызывать снова и снова.
 
-    Можно передать свою aiohttp-сессию (если оркестратор держит одну сессию
-    на несколько задач) — тогда она не будет закрыта в конце функции.
+    Возвращает код: EXIT_OK, EXIT_BLOCKED, EXIT_LAYOUT_CHANGED или
+    EXIT_NO_PAGES (не загрузилась первая страница списка). После
+    неудачного уровня 1 карточки не качаются: сайт недоступен или не
+    пускает, лишние запросы только усугубят.
+
+    Можно передать свою сессию (оркестратор держит одну на весь процесс) —
+    тогда она не будет закрыта в конце функции.
     """
     own_session = session is None
     if own_session:
-        session = _new_session()
+        session = _new_session(cookies_path)
+    burned = False
     try:
         if stage in ("list", "all"):
-            await run_list_stage(session)
+            if await run_list_stage(session) is None:
+                return EXIT_NO_PAGES
         if stage in ("detail", "all"):
-            # ОТДЕЛЬНАЯ СЕССИЯ ДЛЯ КАРТОЧЕК.
-            #
-            # Наблюдение с прода: уровень 1 спокойно качает 169 страниц
-            # списка, а первый же запрос карточки отдаёт 468. При этом
-            # ручной curl к ТОЙ ЖЕ карточке с ТОГО ЖЕ IP возвращает 200.
-            # Значит дело не в адресе и не в частоте (паузы 4-6с), и не
-            # в заголовках — они те же, что работали на списке.
-            #
-            # Отличие ровно одно: к началу уровня 2 сессия уже сделала
-            # 169 запросов и накопила куки krisha. Похоже, по этой
-            # сессии нас и помечают. Свежая сессия без куки-хранилища
-            # (DummyCookieJar) ставит нас в те же условия, что и curl.
-            #
-            # Если 468 повторится и на свежей сессии — гипотеза неверна,
-            # и копать надо в другом месте (TLS-отпечаток, поведенческие
-            # сигналы). Проверяется одним прогоном.
-            detail_session = _new_session()
-            try:
-                await run_detail_stage(detail_session)
-            finally:
-                await detail_session.close()
+            await run_detail_stage(session)
+        return EXIT_OK
+    except AbortRun as e:
+        handle_abort(session, e, BLOCKED_SAMPLE, cookies_path)
+        burned = isinstance(e, BlockedError)
+        return e.exit_code
     finally:
+        if not burned:
+            save_cookies(session, cookies_path)
         if own_session:
             await session.close()
 
 
-if __name__ == "__main__":
+def main():
+    # Консоль Windows в cp1251 падает на эмодзи в выводе.
+    sys.stdout.reconfigure(errors="replace")
+
     arg = sys.argv[1] if len(sys.argv) > 1 else "all"
     if arg not in ("list", "detail", "all"):
-        print("Использование: python krisha_parser.py [list|detail|all]")
+        print("Использование: python v2_krisha_pars_fixed.py [list|detail|all]")
         sys.exit(1)
 
     try:
-        asyncio.run(run_cycle(arg))
+        exit_code = asyncio.run(run_cycle(arg))
     except KeyboardInterrupt:
         print("\nПрервано пользователем. Прогресс сохранён, можно продолжить позже.")
-        sys.exit(0)
+        sys.exit(130)
+    sys.exit(exit_code)
+
+
+if __name__ == "__main__":
+    main()
