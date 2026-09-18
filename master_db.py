@@ -31,6 +31,21 @@ status="missing" и последним известным состоянием; 
 неполные id выдаются через needs_refetch_ids() и уходят в очередь на
 повторное скачивание. Чтобы вечно битое объявление не крутилось в очереди
 бесконечно, попытки считаются в таблице fetch_failures.
+
+ПРО СОБЫТИЯ (listing_events): отдельный журнал для внешних потребителей
+(например, микросервиса оценки), которым нужно узнавать о новых и
+подешевевших объявлениях, не пропуская ни одного, даже если опрашивают
+раз в час, а не раз в 5 минут. Пишется ЗДЕСЬ, а не в fast_track.py,
+потому что и fast track, и full scan равноправно могут первыми увидеть
+новое объявление или зафиксировать падение цены (full scan докачивает
+карточки вне узкого окна fast track) — событие должно фиксироваться
+независимо от того, кто из двух сборщиков его заметил, иначе часть
+событий терялась бы в зависимости от того, чей прогон оказался раньше.
+
+"Новое" здесь — не "впервые увидели МЫ" (это дало бы сотни ложных "new"
+при докачке долга старых карточек или после простоя сборщика), а
+"опубликовано на krisha недавно" — проверяется по created_at. См.
+NEW_LISTING_MAX_AGE_DAYS и upsert_full.
 """
 
 import csv
@@ -43,9 +58,25 @@ import paths
 DB_PATH = os.environ.get("KRISHA_DB") or paths.data_path("krisha_astana.db")
 
 # Сколько объявление может не появляться в обходах, прежде чем будет
-# помечено missing. По умолчанию 1.5 интервала полного обхода (6ч) —
-# один пропуск прощается, два подряд уже нет. См. mark_missing.
-MISSING_GRACE_SECONDS = float(os.environ.get("MISSING_GRACE_S", str(9 * 3600)))
+# помечено missing. См. mark_missing.
+#
+# Отсчёт идёт от last_seen_at до КОНЦА текущего обхода (mark_missing
+# вызывается после карточек), а обход при долге по карточкам длится до
+# ~2ч. При интервале 2ч±15мин 6 часов прощают один пропуск даже в самом
+# длинном обходе и два — в обычном. Меньше (например, 1.5 интервала = 3ч)
+# нельзя: длинный обход помечал бы missing после первого же пропуска.
+MISSING_GRACE_SECONDS = float(os.environ.get("MISSING_GRACE_S", str(6 * 3600)))
+
+# Событие "new" в listing_events пишется, только если объявление
+# ОПУБЛИКОВАНО на krisha недавно (created_at — дата без времени, UTC).
+# Иначе докачка долга старых карточек full scan'ом или возврат сборщика
+# после простоя выдали бы потребителю сотни старых объявлений как новые.
+# 1 день — с запасом на переход через полночь по Астане (UTC+5) при
+# сравнении с UTC-датой.
+NEW_LISTING_MAX_AGE_DAYS = int(os.environ.get("NEW_LISTING_MAX_AGE_DAYS", "1"))
+
+EVENT_NEW = "new"
+EVENT_PRICE_DROP = "price_drop"
 
 # Имя CSV осталось прежним, но теперь это не хранилище, а точка
 # ВЫГРУЗКИ/ЗАГРУЗКИ (export_csv/import_csv). Если оркестратор или скрипты
@@ -179,6 +210,24 @@ def _create_schema(conn):
         "CREATE INDEX IF NOT EXISTS idx_price_history_at ON price_history(observed_at)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_listings_status ON listings(status)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_listings_last_seen ON listings(last_seen_at)")
+    # Курсорный журнал для внешних потребителей (см. докстринг модуля).
+    # event_id — автоинкремент, а не observed_at: как курсор для опроса он
+    # не зависит от точности часов и не спотыкается о несколько событий в
+    # одну секунду (fast track пишет пачку событий в одной транзакции —
+    # точности в секундах недостаточно, чтобы отличить их порядок).
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS listing_events (
+            event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            price REAL,
+            old_price REAL,
+            observed_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_listing_events_id ON listing_events(id)")
     # Догоняем схему, если модуль обновился и появились новые колонки.
     have = {r[1] for r in conn.execute("PRAGMA table_info(listings)")}
     for col in DETAIL_FIELDNAMES:
@@ -287,6 +336,50 @@ def get_row(conn, advert_id):
     return dict(row) if row else None
 
 
+def _is_recent_listing(created_at, now_iso):
+    """created_at — дата публикации на krisha ('2026-07-17', без времени).
+    True, если она не старше NEW_LISTING_MAX_AGE_DAYS относительно даты
+    из now_iso. Отсутствующий/нечитаемый created_at — не улика "новое",
+    поэтому False, а не пропуск проверки."""
+    if not created_at:
+        return False
+    try:
+        published = datetime.strptime(str(created_at)[:10], "%Y-%m-%d").date()
+    except ValueError:
+        return False
+    try:
+        now_date = datetime.fromisoformat(str(now_iso).replace("Z", "+00:00")).date()
+    except ValueError:
+        return False
+    return 0 <= (now_date - published).days <= NEW_LISTING_MAX_AGE_DAYS
+
+
+def record_listing_events(conn, events):
+    """events: [(id, reason, price, old_price, observed_at), ...].
+    reason — EVENT_NEW или EVENT_PRICE_DROP."""
+    events = list(events)
+    if not events:
+        return 0
+    conn.executemany(
+        "INSERT INTO listing_events (id, reason, price, old_price, observed_at) "
+        "VALUES (?, ?, ?, ?, ?)",
+        events,
+    )
+    return len(events)
+
+
+def listing_events_since(conn, since_id, limit=200):
+    """События с event_id > since_id, по возрастанию — курсорный опрос для
+    внешних потребителей. limit ограничивает страницу; потребитель должен
+    перезапрашивать с новым since, пока страница не станет короче limit."""
+    cur = conn.execute(
+        "SELECT event_id, id, reason, price, old_price, observed_at "
+        "FROM listing_events WHERE event_id > ? ORDER BY event_id LIMIT ?",
+        (since_id, limit),
+    )
+    return [dict(r) for r in cur.fetchall()]
+
+
 def stats(conn):
     where_complete = " AND ".join(f"{f} IS NOT NULL" for f in REQUIRED_FOR_COMPLETE)
     row = conn.execute(
@@ -359,10 +452,24 @@ def upsert_full(conn, fresh_rows, now=None):
 
     Пишет ТОЛЬКО переданные id — не трогает остальную таблицу. Именно
     поэтому параллельный процесс больше не может потерять свои правки.
+
+    Событие "new" пишется для id, которых в listings ЕЩЁ НЕ БЫЛО (не по
+    price IS NULL — у неполной строки из refetch_ids цена тоже может
+    быть NULL, и это не то же самое, что "строки не было вовсе") и чья
+    карточка полна и опубликована на krisha недавно. Иначе докачка долга
+    старых карточек full scan'ом выдала бы их потребителю как новые.
     """
     now = now or utcnow_iso()
+    if fresh_rows:
+        placeholders = ",".join("?" for _ in fresh_rows)
+        existing_before = {r[0] for r in conn.execute(
+            f"SELECT id FROM listings WHERE id IN ({placeholders})", list(fresh_rows))}
+    else:
+        existing_before = set()
+
     payload = []
     completed = []
+    new_events = []
     for rid, detail in fresh_rows.items():
         row = dict(detail)
         row["id"] = rid
@@ -372,6 +479,8 @@ def upsert_full(conn, fresh_rows, now=None):
         payload.append([_coerce(c, row.get(c)) for c in DETAIL_FIELDNAMES])
         if is_complete(row):
             completed.append((rid,))
+            if rid not in existing_before and _is_recent_listing(row.get("created_at"), now):
+                new_events.append((rid, EVENT_NEW, _coerce("price", row.get("price")), None, now))
     if not payload:
         return 0
 
@@ -382,6 +491,8 @@ def upsert_full(conn, fresh_rows, now=None):
         {rid: d.get("price") for rid, d in fresh_rows.items() if d.get("price") is not None},
         now,
     )
+    if new_events:
+        record_listing_events(conn, new_events)
 
     conn.executemany(_upsert_sql(), payload)
     if completed:
@@ -414,6 +525,7 @@ def record_price_changes(conn, price_by_id, now=None):
         return 0
 
     changes = []
+    drop_events = []
     # Батчами по 500 — ограничение SQLite на число параметров в IN.
     for i in range(0, len(ids), 500):
         chunk = ids[i:i + 500]
@@ -434,7 +546,9 @@ def record_price_changes(conn, price_by_id, now=None):
             old = known.get(rid)
             if old is None:
                 # Объявления ещё нет в listings — это первая встреча.
-                # Пишем стартовую точку ряда.
+                # Пишем стартовую точку ряда. Событие "new" сюда не
+                # относится — это дело upsert_full (там же решается,
+                # опубликовано ли объявление недавно).
                 changes.append((rid, new, now))
             elif rid not in seeded:
                 # Ряд ещё не начат (строка пришла из сидирования или из
@@ -453,8 +567,15 @@ def record_price_changes(conn, price_by_id, now=None):
                 changes.append((rid, float(old), old_at))
                 if abs(float(old) - float(new)) > 0.01:
                     changes.append((rid, new, now))
+                    if float(new) < float(old):
+                        drop_events.append((rid, EVENT_PRICE_DROP, new, float(old), now))
             elif abs(float(old) - float(new)) > 0.01:
                 changes.append((rid, new, now))
+                if float(new) < float(old):
+                    drop_events.append((rid, EVENT_PRICE_DROP, new, float(old), now))
+
+    if drop_events:
+        record_listing_events(conn, drop_events)
 
     if changes:
         # INSERT OR IGNORE: если за одну секунду пришло два наблюдения по

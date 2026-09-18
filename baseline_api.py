@@ -17,6 +17,7 @@ import time
 import secrets
 import sqlite3
 
+import master_db
 import paths
 from datetime import datetime, timezone
 
@@ -40,10 +41,15 @@ API_KEY = os.environ.get("BASELINE_API_KEY", "").strip()
 MAX_PAGE_SIZE = 500
 DEFAULT_PAGE_SIZE = 100
 
+# Тот же потолок для /listings/changes — по тем же причинам (полные
+# карточки в ответе, не только id).
+CHANGES_MAX_PAGE_SIZE = 500
+CHANGES_DEFAULT_PAGE_SIZE = 200
+
 # Возраст, после которого baseline считается протухшим и /health отдаёт
-# 503. По умолчанию — два интервала полного обхода (6ч), то есть один
+# 503. По умолчанию — два интервала полного обхода (2ч), то есть один
 # пропущенный цикл ещё нормально, два подряд уже нет.
-STALE_AFTER_SECONDS = int(os.environ.get("BASELINE_STALE_AFTER_S", str(2 * 6 * 3600)))
+STALE_AFTER_SECONDS = int(os.environ.get("BASELINE_STALE_AFTER_S", str(2 * 2 * 3600)))
 
 # Сколько ждать ПЕРВОГО baseline на пустом диске, прежде чем считать
 # это поломкой. Полный обход идёт ~1.5ч, берём с запасом на ретраи.
@@ -161,6 +167,52 @@ def price_index_endpoint():
         }
     finally:
         conn.close()
+
+
+@app.get("/listings/changes", dependencies=[Depends(require_api_key)])
+def listings_changes(since: int = Query(0, ge=0),
+                      limit: int = Query(CHANGES_DEFAULT_PAGE_SIZE, ge=1,
+                                        le=CHANGES_MAX_PAGE_SIZE)):
+    """Курсорный поток новых объявлений и подешевений для внешних
+    потребителей (например, микросервиса оценки).
+
+    В отличие от /baseline/*, читает НЕ версионированный снимок, а живой
+    master_db — эти события пишутся туда каждым прогоном fast track и
+    full scan (см. master_db.record_listing_events), а не раз в
+    BASELINE_BUILD_INTERVAL_MIN минут. Курсор — since=event_id последней
+    полученной записи; отдаём события строго после него. Первый запрос —
+    since=0. Если вернулось ровно limit записей, скорее всего есть ещё —
+    нужно повторить запрос с next_since.
+
+    "new" пишется только для объявлений, опубликованных на krisha не
+    позже NEW_LISTING_MAX_AGE_DAYS назад (см. master_db.upsert_full) —
+    докачка старых объявлений не считается "новой".
+    """
+    with master_db.connect() as conn:
+        events = master_db.listing_events_since(conn, since, limit)
+    next_since = events[-1]["event_id"] if events else since
+    return {
+        "since": since,
+        "next_since": next_since,
+        "count": len(events),
+        "events": events,
+    }
+
+
+@app.get("/listings/{advert_id}", dependencies=[Depends(require_api_key)])
+def listing_detail(advert_id: str):
+    """Текущая полная карточка объявления из живого master_db.
+
+    Нужен вместе с /listings/changes: событие несёт только id/цену, а
+    полные поля (площадь, комнаты, адрес — то, чем оценивать объявление)
+    читаются отсюда сразу после события, не дожидаясь следующей публикации
+    baseline (до BASELINE_BUILD_INTERVAL_MIN минут).
+    """
+    with master_db.connect() as conn:
+        row = master_db.get_row(conn, advert_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="id не найден")
+    return row
 
 
 @app.get("/health")

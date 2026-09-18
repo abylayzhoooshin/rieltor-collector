@@ -25,7 +25,7 @@ curl http://localhost:8001/baseline/meta
 | Файл | Назначение |
 |---|---|
 | `service.py` | Точка входа: оркестратор + FastAPI в одном event loop |
-| `orchestrator.py` | Расписание: full scan раз в 6ч, fast track раз в 5 мин |
+| `orchestrator.py` | Расписание: full scan раз в 2ч, fast track раз в 5 мин |
 | `v2_krisha_pars_fixed.py` | Полный обход (slow track): список страниц + детальные карточки; общий сетевой слой (curl_cffi) |
 | `fast_track.py` | Быстрый обход первых страниц для свежих объявлений |
 | `master_db.py` | SQLite-реестр: схема, апсерты, история цен |
@@ -34,7 +34,7 @@ curl http://localhost:8001/baseline/meta
 | `dedupe_baseline.py` | Поиск дублей (блокинг + правила + кластеризация) |
 | `price_index.py` | Приведение цен во времени по официальному ряду |
 | `official_rent_index.json` | Ряд БНС (конфигурация, правится руками) |
-| `baseline_api.py` | HTTP: `/health`, `/baseline/meta`, `/baseline/table`, `/price-index` |
+| `baseline_api.py` | HTTP: `/health`, `/baseline/meta`, `/baseline/table`, `/price-index`, `/listings/changes`, `/listings/{id}` |
 | `seed_baseline.py` | Разовая заливка исторического CSV в базу |
 
 ## Ключевые решения
@@ -77,6 +77,17 @@ krisha отсортирован по дате, новые объявления �
 и за время обхода строка может уехать на следующую страницу — без
 отсрочки такие объявления мигали бы active/missing каждый цикл.
 
+**Событийный лог для внешних потребителей.** `master_db.listing_events` —
+курсорный журнал "new"/"price_drop", который пишут ОБА сборщика при
+апсерте (см. `master_db.upsert_full`/`record_price_changes`), а не только
+fast track: иначе события, замеченные full scan'ом вне узкого окна fast
+track, терялись бы. "new" фиксируется только для объявлений, реально
+опубликованных на krisha недавно (`created_at`, порог —
+`NEW_LISTING_MAX_AGE_DAYS`) — иначе докачка долга старых карточек full
+scan'ом выглядела бы как лавина "новых" объявлений. Отдаётся по
+`/listings/changes?since=<event_id>` — курсор, а не время, поэтому
+потребитель, опросивший сервис позже обычного, не теряет события.
+
 ## Переменные окружения
 
 | Переменная | По умолчанию | Назначение |
@@ -87,12 +98,14 @@ krisha отсортирован по дате, новые объявления �
 | `BASELINE_API_KEY` | пусто | Токен для `/baseline/*`. **Пусто = проверка выключена** |
 | `BASELINE_API_PORT` | `8001` | Порт HTTP |
 | `BASELINE_BUILD_INTERVAL_MIN` | `30` | Как часто пересобирать baseline |
-| `BASELINE_STALE_AFTER_S` | `43200` | Возраст, после которого `/health` отдаёт 503 |
+| `BASELINE_STALE_AFTER_S` | `14400` | Возраст, после которого `/health` отдаёт 503 |
 | `BASELINE_STARTUP_GRACE_S` | `14400` | Сколько ждать первого baseline на пустом диске |
 | `BASELINE_MAX_SHRINK` | `0.25` | Допустимое сокращение baseline; больше — отказ публиковать |
-| `FAST_INTERVAL_MIN` | `60` | Интервал fast track |
+| `FULL_SCAN_INTERVAL_H` | `2` | Интервал full scan (среднее; реальный момент — в диапазоне `FULL_SCAN_INTERVAL_H_MIN..MAX`, по умолчанию 1.75-2.25ч) |
+| `FAST_INTERVAL_MIN` | `5` | Интервал fast track (среднее; реальный момент — `FAST_INTERVAL_MIN_MIN..MAX`, по умолчанию 4-6мин) |
 | `BLOCKED_COOLDOWN_MIN` | `90` | Пауза всего сбора после блокировки антиботом |
-| `MISSING_GRACE_S` | `32400` | Сколько не видеть объявление, прежде чем пометить снятым |
+| `MISSING_GRACE_S` | `21600` | Сколько не видеть объявление, прежде чем пометить снятым |
+| `NEW_LISTING_MAX_AGE_DAYS` | `1` | Насколько недавно объявление должно быть опубликовано на krisha, чтобы событие "new" засчиталось |
 | `OFFICIAL_INDEX_PATH` | рядом с кодом | Путь к ряду БНС |
 | `LOG_LEVEL` | `INFO` | Уровень логирования |
 
@@ -140,6 +153,17 @@ stat.gov.kz → Статистика цен → Электронные табл�
 500. Полную таблицу забирают постраничным обходом, сверяясь с `total` и
 `version` в ответе; если версия сменилась посреди обхода, страницы
 относятся к разным наборам данных и обход надо начать заново.
+
+`/listings/changes?since=<event_id>&limit=<n>` — курсорный поток новых
+объявлений (`reason=new`) и подешевений (`reason=price_drop`) из живого
+`master_db`, а не из версионированного baseline. Первый запрос —
+`since=0`. Каждый ответ содержит `next_since`; если `count` в ответе
+равен `limit`, скорее всего есть ещё, и нужно повторить запрос с
+`since=next_since`. `limit` по умолчанию 200, максимум 500.
+
+`/listings/{id}` — текущая полная карточка объявления из `master_db`
+(площадь, комнаты, адрес и т.п.), не дожидаясь следующей публикации
+baseline. 404, если id не найден.
 
 ## Что ещё не сделано
 
