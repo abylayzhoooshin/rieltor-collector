@@ -15,6 +15,12 @@ fast_known_ids.json
 list_meta.json
 progress_list.json
 progress_detail.json
+*.corrupted
+*.tmp
+
+# Куки сессии krisha и сохранённые ответы антибота
+krisha_cookies.json
+*_blocked_last.html
 
 # Выгрузки и промежуточные CSV
 krisha_astana_ids.csv
