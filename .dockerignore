@@ -16,4 +16,8 @@ fast_known_ids.json
 progress_list.json
 progress_detail.json
 list_meta.json
+krisha_cookies.json
+*_blocked_last.html
+*.corrupted
+*.tmp
 .git/
