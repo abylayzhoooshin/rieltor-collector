@@ -1,10 +1,11 @@
 # ---- Данные и состояние ----
 # Ничего из этого в репозиторий попадать не должно: это runtime-состояние,
 # которое на проде живёт на persistent disk (DATA_DIR), а локально — рядом
-# с кодом. Закоммиченная krisha_astana.db весит десятки мегабайт и
+# с кодом. Закоммиченная krisha_almaty.db весит десятки мегабайт и
 # конфликтует при каждом pull.
 data/
 baseline_versions/
+candidate_versions/
 *.db
 *.db-wal
 *.db-shm
@@ -23,15 +24,19 @@ krisha_cookies.json
 *_blocked_last.html
 
 # Выгрузки и промежуточные CSV
-krisha_astana_ids.csv
-krisha_astana_detail.csv
-krisha_astana_baseline.csv
+krisha_almaty_ids.csv
+krisha_almaty_detail.csv
+krisha_almaty_baseline.csv
 fast_new_listings.csv
 *_before_dedup.csv
 *_dropped.csv
 
-# ВАЖНО: official_rent_index.json НЕ игнорируется — это конфигурация,
-# а не данные. Он должен ехать в репозиторий и в образ.
+# official_rent_index.json.unused_astana_index — ряд БНС по Астане из
+# исходного проекта, для Алматы не подходит (price_index.py тут не
+# откалиброван, см. README). Переименован, а не удалён, чтобы
+# from_official() падал в безопасный дефолт measured=false. Если заведёте
+# реальный ряд под Алматы — он должен называться official_rent_index.json,
+# ехать в репозиторий и в образ как конфигурация, а не данные (не игнорить).
 
 # ---- Логи ----
 *.log
