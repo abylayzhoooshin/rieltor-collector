@@ -225,25 +225,6 @@ def house_conflict(a, b):
 # ---------------------------- признаки ----------------------------
 
 def same_building(a, b):
-    # Координаты на krisha — это точка, которую продавец САМ ставит на карте
-    # при публикации, не GPS. При каждой перевыкладке (а один и тот же
-    # человек перевыкладывает вместо правки старого объявления — см.
-    # price_index.py) пин ставится заново и может промахнуться не на
-    # десятки, а на ТЫСЯЧИ метров — проверено на реальной паре дублей:
-    # тот же complex_id, тот же house_num, та же цена/площадь/этаж/текст
-    # слово в слово, а расстояние между пинами — 4.4 км.
-    #
-    # Поэтому точное совпадение ЖК (complex_id) И номера дома (house_num) —
-    # более надёжное доказательство "тот же дом", чем GPS-дистанция, и
-    # принимается БЕЗ ограничения по расстоянию. Ложные срабатывания (два
-    # разных объекта с одинаковым текстом адреса) отсекает не эта функция,
-    # а более строгие проверки дальше по decide() — комнатность, площадь,
-    # этаж, цена, текст описания.
-    house_a, house_b = clean_house(a.get("house_num")), clean_house(b.get("house_num"))
-    complex_a, complex_b = a.get("complex_id"), b.get("complex_id")
-    if house_a is not None and house_a == house_b and complex_a is not None and complex_a == complex_b:
-        return True
-
     # Проверяем ОБЕ координаты у ОБЕИХ строк. Раньше проверялась только
     # широта, а haversine_m читал и долготу — карточка с lat без lon
     # (усечённый JSON, смена вёрстки) роняла весь дедуп с TypeError, и
@@ -465,7 +446,7 @@ def dedupe_rows(rows, text_threshold=0.35, max_block=60):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--input", default="baseline/krisha_almaty_baseline.csv")
+    ap.add_argument("--input", default="baseline/krisha_astana_baseline.csv")
     ap.add_argument("--text-threshold", type=float, default=0.35)
     ap.add_argument("--write", metavar="OUT", default=None,
                      help="куда записать очищенный файл (по умолчанию не пишет, только отчёт)")

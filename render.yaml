@@ -28,12 +28,8 @@
 services:
   - type: web
     runtime: docker
-    name: rieltor-collector-almaty
-    # Singapore, не Frankfurt: два других сервиса (аренда/покупка по
-    # Астане) уже сидят в eu-frankfurt и делят с ним пул исходящих IP.
-    # Разный регион = разный IP-пул, чтобы запросы трёх сборщиков к
-    # krisha.kz не выглядели одним и тем же клиентом.
-    region: singapore
+    name: rieltor-collector
+    region: frankfurt          # ближайший к Казахстану из доступных Render-регионов
     plan: 0.5c-512mb           # дешёвый платный план — минимум, к которому можно прицепить диск
     numInstances: 1
 
@@ -54,13 +50,13 @@ services:
     # запуск продолжит с того места, а не с нуля.
 
     disk:
-      name: rieltor-almaty-data
+      name: rieltor-data
       mountPath: /app/data     # совпадает с ENV в Dockerfile: KRISHA_DB, BASELINE_DIR
       sizeGB: 1
 
     envVars:
       - key: KRISHA_DB
-        value: /app/data/krisha_almaty.db
+        value: /app/data/krisha_astana.db
       - key: BASELINE_DIR
         value: /app/data/baseline_versions
       - key: LOG_LEVEL

@@ -26,7 +26,7 @@ import re
 
 import aiohttp
 
-LIST_URL = "https://krisha.kz/arenda/kvartiry/almaty/"
+LIST_URL = "https://krisha.kz/arenda/kvartiry/astana/"
 CARD_URL = "https://krisha.kz/a/show/{}"
 
 HEADERS = {

@@ -49,14 +49,13 @@ NEW_LISTING_MAX_AGE_DAYS и upsert_full.
 """
 
 import csv
-import hashlib
 import os
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 import paths
 
-DB_PATH = os.environ.get("KRISHA_DB") or paths.data_path("krisha_almaty.db")
+DB_PATH = os.environ.get("KRISHA_DB") or paths.data_path("krisha_astana.db")
 
 # Сколько объявление может не появляться в обходах, прежде чем будет
 # помечено missing. См. mark_missing.
@@ -78,25 +77,12 @@ NEW_LISTING_MAX_AGE_DAYS = int(os.environ.get("NEW_LISTING_MAX_AGE_DAYS", "1"))
 
 EVENT_NEW = "new"
 EVENT_PRICE_DROP = "price_drop"
-PRICE_DROP_DETAIL_MAX_AGE_HOURS = float(os.environ.get("PRICE_DROP_DETAIL_MAX_AGE_HOURS", "24"))
-
-PRESENCE_BOOTSTRAP = "bootstrap_state"
-PRESENCE_FIRST_SEEN = "first_seen"
-# Compatibility/import event type. Routine live active->active observations
-# only advance listings.last_seen_at and deliberately do not emit this event.
-PRESENCE_SEEN = "seen"
-PRESENCE_MISSING = "missing_confirmed"
-PRESENCE_REACTIVATED = "reactivated"
-
-PRICE_INITIAL = "initial_price"
-PRICE_CHANGED = "price_change"
-PRICE_BOOTSTRAP = "bootstrap_price"
 
 # Имя CSV осталось прежним, но теперь это не хранилище, а точка
 # ВЫГРУЗКИ/ЗАГРУЗКИ (export_csv/import_csv). Если оркестратор или скрипты
 # анализа ссылаются на master_db.DETAIL_OUTPUT_CSV — они продолжат
 # получать тот же путь и тот же набор колонок.
-DETAIL_OUTPUT_CSV = paths.data_path("krisha_almaty_detail.csv")
+DETAIL_OUTPUT_CSV = paths.data_path("krisha_astana_detail.csv")
 
 # Сколько раз пробуем перекачать неполную/непрокачавшуюся карточку,
 # прежде чем перестать её предлагать. Счётчик обнуляется при успехе.
@@ -149,10 +135,6 @@ LIFECYCLE_FIELDNAMES = [
     "first_seen_at",  # когда объявление впервые попало в базу
     "last_seen_at",  # когда его в последний раз реально видели на сайте
     "status",  # active | missing — никогда не удаляем, только помечаем
-    "initial_price",  # цена при первом появлении; после этого неизменна
-    "missing_detected_at",  # когда active впервые сменился на missing
-    "price_drop_count",  # число реально зафиксированных снижений цены
-    "reactivation_count",  # число переходов missing -> active
 ]
 
 DETAIL_FIELDNAMES = SITE_FIELDNAMES + LIFECYCLE_FIELDNAMES
@@ -166,10 +148,8 @@ INT_COLUMNS = {
     "complex_id",
     "photo_count",
     "is_identity_confirmed",
-    "price_drop_count",
-    "reactivation_count",
 }
-REAL_COLUMNS = {"square_m2", "latitude", "longitude", "initial_price"}
+REAL_COLUMNS = {"square_m2", "latitude", "longitude"}
 
 # Поля, без которых карточка бесполезна для будущей оценки. Именно по ним
 # определяется, надо ли перекачать объявление заново.
@@ -178,45 +158,15 @@ REQUIRED_FOR_COMPLETE = ("price", "rooms", "square_m2")
 _TYPE_SQL = {c: "INTEGER" for c in INT_COLUMNS}
 _TYPE_SQL.update({c: "REAL" for c in REAL_COLUMNS})
 
-_COLUMN_DDL = {
-    "price_drop_count": "INTEGER NOT NULL DEFAULT 0",
-    "reactivation_count": "INTEGER NOT NULL DEFAULT 0",
-}
-
 
 def utcnow_iso():
-    return datetime.now(timezone.utc).isoformat(timespec="microseconds")
-
-
-def _source_event_id(namespace, *parts):
-    """Stable opaque ID for repeatable migrations and live event writes."""
-    payload = "\x1f".join([namespace, *("" if p is None else str(p) for p in parts)])
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
-
-
-def _timestamp(value):
-    try:
-        stamp = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-        return stamp.replace(tzinfo=timezone.utc) if stamp.tzinfo is None else stamp
-    except (ValueError, TypeError):
-        return datetime.min.replace(tzinfo=timezone.utc)
-
-
-def _rows_by_id(conn, ids):
-    ids = list(ids)
-    result = {}
-    for start in range(0, len(ids), 500):
-        chunk = ids[start:start + 500]
-        placeholders = ",".join("?" for _ in chunk)
-        result.update((r["id"], dict(r)) for r in conn.execute(
-            f"SELECT * FROM listings WHERE id IN ({placeholders})", chunk))
-    return result
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
 def _column_ddl():
     parts = []
     for col in DETAIL_FIELDNAMES:
-        sql_type = _COLUMN_DDL.get(col, _TYPE_SQL.get(col, "TEXT"))
+        sql_type = _TYPE_SQL.get(col, "TEXT")
         if col == "id":
             parts.append("id TEXT PRIMARY KEY")
         else:
@@ -226,7 +176,6 @@ def _column_ddl():
 
 def _create_schema(conn):
     conn.execute(f"CREATE TABLE IF NOT EXISTS listings (\n    {_column_ddl()}\n)")
-    conn.execute("CREATE TABLE IF NOT EXISTS detail_refresh_queue (id TEXT PRIMARY KEY)")
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS fetch_failures (
@@ -283,149 +232,7 @@ def _create_schema(conn):
     have = {r[1] for r in conn.execute("PRAGMA table_info(listings)")}
     for col in DETAIL_FIELDNAMES:
         if col not in have:
-            ddl = _COLUMN_DDL.get(col, _TYPE_SQL.get(col, "TEXT"))
-            conn.execute(f"ALTER TABLE listings ADD COLUMN {col} {ddl}")
-    # Идемпотентный backfill старой базы. Текущая цена — единственное
-    # безопасное приближение начальной цены для уже накопленных строк.
-    if conn.execute(
-            "SELECT 1 FROM listings WHERE initial_price IS NULL AND price IS NOT NULL LIMIT 1"
-    ).fetchone():
-        conn.execute(
-            "UPDATE listings SET initial_price = price "
-            "WHERE initial_price IS NULL AND price IS NOT NULL"
-        )
-    if conn.execute("SELECT 1 FROM listings WHERE price_drop_count IS NULL LIMIT 1").fetchone():
-        conn.execute("UPDATE listings SET price_drop_count = 0 WHERE price_drop_count IS NULL")
-    if conn.execute("SELECT 1 FROM listings WHERE reactivation_count IS NULL LIMIT 1").fetchone():
-        conn.execute("UPDATE listings SET reactivation_count = 0 WHERE reactivation_count IS NULL")
-
-
-def _migration_candidate_events(conn, applied_at):
-    """Create the append-only source history and bootstrap legacy state once."""
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS source_event_log (
-            event_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            source_event_id TEXT NOT NULL UNIQUE,
-            event_kind TEXT NOT NULL
-        )
-        """
-    )
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS price_observations (
-            source_event_id TEXT PRIMARY KEY,
-            listing_id TEXT NOT NULL,
-            observed_at TEXT NOT NULL,
-            price REAL NOT NULL,
-            event_type TEXT NOT NULL,
-            history_complete INTEGER NOT NULL CHECK(history_complete IN (0, 1))
-        )
-        """
-    )
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_price_observations_order "
-        "ON price_observations(listing_id, observed_at, source_event_id)"
-    )
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS listing_presence_events (
-            source_event_id TEXT PRIMARY KEY,
-            listing_id TEXT NOT NULL,
-            event_type TEXT NOT NULL,
-            status_after TEXT NOT NULL,
-            observed_at TEXT NOT NULL,
-            history_complete INTEGER NOT NULL CHECK(history_complete IN (0, 1))
-        )
-        """
-    )
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_presence_events_order "
-        "ON listing_presence_events(listing_id, observed_at, source_event_id)"
-    )
-
-    presence = []
-    for row in conn.execute("SELECT id, status FROM listings ORDER BY id"):
-        source_id = _source_event_id("presence-bootstrap-v1", row["id"])
-        presence.append((source_id, row["id"], PRESENCE_BOOTSTRAP,
-                         row["status"] or "unknown", applied_at, 0))
-    if presence:
-        conn.executemany(
-            "INSERT OR IGNORE INTO listing_presence_events "
-            "(source_event_id,listing_id,event_type,status_after,observed_at,history_complete) "
-            "VALUES (?,?,?,?,?,?)",
-            presence,
-        )
-
-    prices = []
-    seen_price_ids = set()
-    previous_id = None
-    for row in conn.execute(
-            "SELECT id, price, observed_at FROM price_history ORDER BY id, observed_at"):
-        event_type = PRICE_INITIAL if row["id"] != previous_id else PRICE_CHANGED
-        previous_id = row["id"]
-        seen_price_ids.add(row["id"])
-        source_id = _source_event_id(
-            "legacy-price-v1", row["id"], row["observed_at"], row["price"])
-        prices.append((source_id, row["id"], row["observed_at"], row["price"],
-                       event_type, 0))
-
-    for row in conn.execute("SELECT id, initial_price, price FROM listings ORDER BY id"):
-        if row["id"] in seen_price_ids:
-            continue
-        price = row["initial_price"] if row["initial_price"] is not None else row["price"]
-        if price is None:
-            continue
-        source_id = _source_event_id("price-bootstrap-v1", row["id"])
-        prices.append((source_id, row["id"], applied_at, price, PRICE_BOOTSTRAP, 0))
-    if prices:
-        conn.executemany(
-            "INSERT OR IGNORE INTO price_observations "
-            "(source_event_id,listing_id,observed_at,price,event_type,history_complete) "
-            "VALUES (?,?,?,?,?,?)",
-            prices,
-        )
-
-    conn.execute(
-        "INSERT OR IGNORE INTO source_event_log(source_event_id,event_kind) "
-        "SELECT source_event_id,'price' FROM price_observations "
-        "ORDER BY listing_id,observed_at,source_event_id"
-    )
-    conn.execute(
-        "INSERT OR IGNORE INTO source_event_log(source_event_id,event_kind) "
-        "SELECT source_event_id,'presence' FROM listing_presence_events "
-        "ORDER BY listing_id,observed_at,source_event_id"
-    )
-
-
-_MIGRATIONS = ((1, _migration_candidate_events),)
-
-
-def _apply_migrations(conn):
-    """Apply every pending migration in order, each under its own write lock."""
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS schema_migrations ("
-        "version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
-    )
-    conn.commit()
-    for version, migration in _MIGRATIONS:
-        conn.execute("BEGIN IMMEDIATE")
-        try:
-            if conn.execute(
-                    "SELECT 1 FROM schema_migrations WHERE version=?", (version,)
-            ).fetchone():
-                conn.commit()
-                continue
-            applied_at = utcnow_iso()
-            migration(conn, applied_at)
-            conn.execute(
-                "INSERT INTO schema_migrations(version,applied_at) VALUES (?,?)",
-                (version, applied_at),
-            )
-            conn.commit()
-        except BaseException:
-            conn.rollback()
-            raise
+            conn.execute(f"ALTER TABLE listings ADD COLUMN {col} {_TYPE_SQL.get(col, 'TEXT')}")
 
 
 @contextmanager
@@ -447,7 +254,6 @@ def connect(path=None):
         conn.execute("PRAGMA busy_timeout=30000")
         _create_schema(conn)
         conn.commit()
-        _apply_migrations(conn)
         yield conn
         conn.commit()
     except BaseException:
@@ -499,60 +305,19 @@ def complete_ids(conn):
 
 def needs_refetch_ids(conn, candidate_ids=None):
     """
-    Неполные карточки и очередь обновления фото, пока не исчерпан лимит
-    попыток. Очередь переживает обновление цены и перезапуск процесса.
+    id, которые в базе есть, но карточка неполная, и мы ещё не исчерпали
+    лимит попыток. Это главная защита от "битая строка залипла навсегда".
     """
     where = " OR ".join(f"l.{f} IS NULL" for f in REQUIRED_FOR_COMPLETE)
     sql = f"""
         SELECT l.id FROM listings l
         LEFT JOIN fetch_failures f ON f.id = l.id
-        WHERE (({where}) OR l.id IN (SELECT id FROM detail_refresh_queue))
-          AND COALESCE(f.attempts, 0) < ?
+        WHERE ({where}) AND COALESCE(f.attempts, 0) < ?
     """
     ids = {r[0] for r in conn.execute(sql, (MAX_FETCH_ATTEMPTS,))}
     if candidate_ids is not None:
         ids &= set(candidate_ids)
     return ids
-
-
-def price_drop_refresh_ids(conn, price_by_id, now=None):
-    """Устаревшие карточки при снижении цены + ранее отложенные обновления.
-
-    Сравниваем с БД, а не с окном fast track; last_seen_at не отражает
-    возраст фотографий. Отсутствующий/битый scraped_at считаем устаревшим.
-    Только чтение: fast track не меняет БД до завершения сетевой стадии.
-    """
-    now_dt = datetime.fromisoformat(now or utcnow_iso())
-    if now_dt.tzinfo is None:
-        now_dt = now_dt.replace(tzinfo=timezone.utc)
-    cutoff = now_dt - timedelta(hours=PRICE_DROP_DETAIL_MAX_AGE_HOURS)
-    ids = list(price_by_id)
-    result = set()
-    for start in range(0, len(ids), 500):
-        chunk = ids[start:start + 500]
-        placeholders = ",".join("?" for _ in chunk)
-        rows = conn.execute(f"""
-            SELECT l.id, l.price, l.scraped_at, q.id AS pending
-            FROM listings l LEFT JOIN detail_refresh_queue q ON q.id = l.id
-            LEFT JOIN fetch_failures f ON f.id = l.id
-            WHERE l.id IN ({placeholders}) AND COALESCE(f.attempts, 0) < ?
-        """, [*chunk, MAX_FETCH_ATTEMPTS])
-        for row in rows:
-            if row["pending"] is not None:
-                result.add(row["id"])
-                continue
-            price = _coerce("price", price_by_id[row["id"]])
-            if price is None or row["price"] is None or row["price"] - price <= 0.01:
-                continue
-            try:
-                scraped = datetime.fromisoformat(row["scraped_at"])
-                if scraped.tzinfo is None:
-                    scraped = scraped.replace(tzinfo=timezone.utc)
-            except (ValueError, TypeError):
-                scraped = None
-            if scraped is None or scraped <= cutoff:
-                result.add(row["id"])
-    return result
 
 
 def giving_up_ids(conn):
@@ -601,45 +366,6 @@ def record_listing_events(conn, events):
         events,
     )
     return len(events)
-
-
-def _record_source_events(conn, event_kind, rows):
-    """Append event rows and their shared monotonic cursor atomically."""
-    rows = list(rows)
-    if not rows:
-        return 0
-    table = "price_observations" if event_kind == "price" else "listing_presence_events"
-    if event_kind == "price":
-        sql = (
-            f"INSERT OR IGNORE INTO {table} "
-            "(source_event_id,listing_id,observed_at,price,event_type,history_complete) "
-            "VALUES (?,?,?,?,?,?)"
-        )
-    else:
-        sql = (
-            f"INSERT OR IGNORE INTO {table} "
-            "(source_event_id,listing_id,event_type,status_after,observed_at,history_complete) "
-            "VALUES (?,?,?,?,?,?)"
-        )
-    before = conn.total_changes
-    conn.executemany(sql, rows)
-    conn.executemany(
-        "INSERT OR IGNORE INTO source_event_log(source_event_id,event_kind) VALUES (?,?)",
-        [(row[0], event_kind) for row in rows],
-    )
-    return conn.total_changes - before
-
-
-def _presence_event_rows(observations):
-    """observations: iterable(listing_id,event_type,status_after,observed_at)."""
-    for listing_id, event_type, status_after, observed_at in observations:
-        source_id = _source_event_id(
-            "presence-live-v1", listing_id, event_type, status_after, observed_at)
-        yield (source_id, listing_id, event_type, status_after, observed_at, 1)
-
-
-def record_presence_events(conn, observations):
-    return _record_source_events(conn, "presence", _presence_event_rows(observations))
 
 
 def listing_events_since(conn, since_id, limit=200):
@@ -703,24 +429,8 @@ def _upsert_sql():
         for c in cols:
             if c in ("id", "first_seen_at"):
                 continue
-            if c == "initial_price":
-                updates.append("initial_price=COALESCE(listings.initial_price, excluded.initial_price)")
-            elif c == "missing_detected_at":
-                updates.append("missing_detected_at=CASE WHEN excluded.status = 'active' "
-                               "THEN NULL ELSE listings.missing_detected_at END")
-            elif c == "price_drop_count":
-                # record_price_changes() увеличивает счётчик до upsert.
-                updates.append("price_drop_count=COALESCE(listings.price_drop_count, 0)")
-            elif c == "reactivation_count":
-                updates.append("reactivation_count=COALESCE(listings.reactivation_count, 0) + "
-                               "CASE WHEN listings.status = 'missing' AND excluded.status = 'active' "
-                               "THEN 1 ELSE 0 END")
-            elif c in always_fresh:
+            if c in always_fresh:
                 updates.append(f"{c}=excluded.{c}")
-            elif c in ("photo_count", "photo_set_hash"):
-                # Пустой новый набор фото должен сбросить и старый хеш.
-                updates.append(f"{c}=CASE WHEN excluded.photo_urls IS NOT NULL "
-                               f"THEN excluded.{c} ELSE listings.{c} END")
             else:
                 updates.append(f"{c}=COALESCE(excluded.{c}, listings.{c})")
 
@@ -750,44 +460,23 @@ def upsert_full(conn, fresh_rows, now=None):
     старых карточек full scan'ом выдала бы их потребителю как новые.
     """
     now = now or utcnow_iso()
-    existing_before = _rows_by_id(conn, fresh_rows)
+    if fresh_rows:
+        placeholders = ",".join("?" for _ in fresh_rows)
+        existing_before = {r[0] for r in conn.execute(
+            f"SELECT id FROM listings WHERE id IN ({placeholders})", list(fresh_rows))}
+    else:
+        existing_before = set()
 
     payload = []
     completed = []
     new_events = []
-    prices = {}
-    price_observed_at = {}
-    presence_transitions = []
     for rid, detail in fresh_rows.items():
         row = dict(detail)
-        observed_at = row.get("scraped_at") or now
-        stored = existing_before.get(rid, {})
-        # Fast track может сохранить пачку после того, как full scan уже
-        # загрузил более свежую карточку. Старую пачку нельзя накатывать сверху.
-        if _timestamp(observed_at) < _timestamp(stored.get("scraped_at")):
-            continue
-        if _timestamp(observed_at) < _timestamp(stored.get("last_seen_at")):
-            for col in ("price", "price_m2", "price_m2_text"):
-                row[col] = stored.get(col)
         row["id"] = rid
         row["first_seen_at"] = now
-        row["last_seen_at"] = max((observed_at, stored.get("last_seen_at") or observed_at), key=_timestamp)
+        row["last_seen_at"] = now
         row["status"] = "active"
-        row["initial_price"] = (stored.get("initial_price")
-                                if stored.get("initial_price") is not None
-                                else (row.get("initial_price")
-                                      if row.get("initial_price") is not None
-                                      else row.get("price")))
-        row["missing_detected_at"] = None
-        row["price_drop_count"] = stored.get("price_drop_count", 0)
-        row["reactivation_count"] = stored.get("reactivation_count", 0)
-        prices[rid] = row.get("price")
-        price_observed_at[rid] = observed_at
         payload.append([_coerce(c, row.get(c)) for c in DETAIL_FIELDNAMES])
-        if rid not in existing_before:
-            presence_transitions.append((rid, PRESENCE_FIRST_SEEN, "active", observed_at))
-        elif stored.get("status") == "missing":
-            presence_transitions.append((rid, PRESENCE_REACTIVATED, "active", observed_at))
         if is_complete(row):
             completed.append((rid,))
             if rid not in existing_before and _is_recent_listing(row.get("created_at"), now):
@@ -799,22 +488,19 @@ def upsert_full(conn, fresh_rows, now=None):
     # строки, иначе прошлая цена будет потеряна.
     record_price_changes(
         conn,
-        {rid: price for rid, price in prices.items() if price is not None},
+        {rid: d.get("price") for rid, d in fresh_rows.items() if d.get("price") is not None},
         now,
-        price_observed_at,
     )
     if new_events:
         record_listing_events(conn, new_events)
-    record_presence_events(conn, presence_transitions)
 
     conn.executemany(_upsert_sql(), payload)
     if completed:
         conn.executemany("DELETE FROM fetch_failures WHERE id = ?", completed)
-        conn.executemany("DELETE FROM detail_refresh_queue WHERE id = ?", completed)
     return len(payload)
 
 
-def record_price_changes(conn, price_by_id, now=None, observed_at_by_id=None):
+def record_price_changes(conn, price_by_id, now=None):
     """Записать в price_history изменения цены И стартовые цены новых id.
 
     ПОЧЕМУ СТАРТОВЫЕ ЦЕНЫ ТОЖЕ НУЖНЫ.
@@ -834,13 +520,11 @@ def record_price_changes(conn, price_by_id, now=None, observed_at_by_id=None):
     не создаёт, так что объём остаётся маленьким.
     """
     now = now or utcnow_iso()
-    observed_at_by_id = observed_at_by_id or {}
     ids = list(price_by_id)
     if not ids:
         return 0
 
     changes = []
-    observations = []
     drop_events = []
     # Батчами по 500 — ограничение SQLite на число параметров в IN.
     for i in range(0, len(ids), 500):
@@ -859,18 +543,13 @@ def record_price_changes(conn, price_by_id, now=None, observed_at_by_id=None):
             new = _coerce("price", price_by_id[rid])
             if new is None:
                 continue
-            observed_at = observed_at_by_id.get(rid) or now
             old = known.get(rid)
             if old is None:
                 # Объявления ещё нет в listings — это первая встреча.
                 # Пишем стартовую точку ряда. Событие "new" сюда не
                 # относится — это дело upsert_full (там же решается,
                 # опубликовано ли объявление недавно).
-                changes.append((rid, new, observed_at))
-                source_id = _source_event_id(
-                    "price-live-v1", rid, observed_at, new, PRICE_INITIAL)
-                observations.append(
-                    (source_id, rid, observed_at, new, PRICE_INITIAL, 1))
+                changes.append((rid, new, now))
             elif rid not in seeded:
                 # Ряд ещё не начат (строка пришла из сидирования или из
                 # старой схемы без price_history). Пишем ДВЕ точки:
@@ -887,33 +566,16 @@ def record_price_changes(conn, price_by_id, now=None, observed_at_by_id=None):
                 old_at = last_seen.get(rid) or now
                 changes.append((rid, float(old), old_at))
                 if abs(float(old) - float(new)) > 0.01:
-                    changes.append((rid, new, observed_at))
-                    source_id = _source_event_id(
-                        "price-live-v1", rid, observed_at, new, PRICE_CHANGED)
-                    observations.append(
-                        (source_id, rid, observed_at, new, PRICE_CHANGED, 1))
+                    changes.append((rid, new, now))
                     if float(new) < float(old):
-                        drop_events.append(
-                            (rid, EVENT_PRICE_DROP, new, float(old), observed_at))
+                        drop_events.append((rid, EVENT_PRICE_DROP, new, float(old), now))
             elif abs(float(old) - float(new)) > 0.01:
-                changes.append((rid, new, observed_at))
-                source_id = _source_event_id(
-                    "price-live-v1", rid, observed_at, new, PRICE_CHANGED)
-                observations.append(
-                    (source_id, rid, observed_at, new, PRICE_CHANGED, 1))
+                changes.append((rid, new, now))
                 if float(new) < float(old):
-                    drop_events.append(
-                        (rid, EVENT_PRICE_DROP, new, float(old), observed_at))
+                    drop_events.append((rid, EVENT_PRICE_DROP, new, float(old), now))
 
     if drop_events:
         record_listing_events(conn, drop_events)
-        conn.executemany(
-            "UPDATE listings SET price_drop_count = COALESCE(price_drop_count, 0) + 1 WHERE id = ?",
-            [(event[0],) for event in drop_events],
-        )
-        refresh = price_drop_refresh_ids(conn, {e[0]: e[2] for e in drop_events}, now)
-        conn.executemany("INSERT OR IGNORE INTO detail_refresh_queue (id) VALUES (?)",
-                         [(rid,) for rid in refresh])
 
     if changes:
         # INSERT OR IGNORE: если за одну секунду пришло два наблюдения по
@@ -922,7 +584,6 @@ def record_price_changes(conn, price_by_id, now=None, observed_at_by_id=None):
             "INSERT OR IGNORE INTO price_history (id, price, observed_at) VALUES (?, ?, ?)",
             changes,
         )
-    _record_source_events(conn, "price", observations)
     return len(changes)
 
 
@@ -935,7 +596,7 @@ def price_history_for(conn, listing_id):
     return [dict(r) for r in cur.fetchall()]
 
 
-def upsert_price_only(conn, price_by_id, now=None, observed_at_by_id=None):
+def upsert_price_only(conn, price_by_id, now=None):
     """
     Для уже известных id, чью карточку заново не качали — патчим только
     price (перезаписываем, без истории) + last_seen_at + status="active"
@@ -944,49 +605,26 @@ def upsert_price_only(conn, price_by_id, now=None, observed_at_by_id=None):
     бесплатно: ни одного detail-запроса. Возвращает число обновлённых.
     """
     now = now or utcnow_iso()
-    observed_at_by_id = observed_at_by_id or {}
-    stored = _rows_by_id(conn, price_by_id)
     payload = []
     for rid, price in price_by_id.items():
-        if rid not in stored:
-            continue
         price = _coerce("price", price)
         if price is None:
             continue
-        observed_at = observed_at_by_id.get(rid) or now
-        if _timestamp(observed_at) < _timestamp(stored.get(rid, {}).get("last_seen_at")):
-            continue
-        payload.append((price, price, observed_at, rid))
+        payload.append((price, now, rid))
     if not payload:
         return 0
 
-    reactivations = [
-        (rid, PRESENCE_REACTIVATED, "active", observed_at)
-        for _, _, observed_at, rid in payload
-        if stored.get(rid, {}).get("status") == "missing"
-    ]
-
     # Фиксируем изменения ДО перезаписи: после UPDATE старая цена
     # недоступна, и факт изменения был бы потерян навсегда.
-    record_price_changes(
-        conn,
-        {rid: price for price, _, _, rid in payload},
-        now,
-        {rid: observed_at for _, _, observed_at, rid in payload},
-    )
+    record_price_changes(conn, {rid: price for price, _, rid in payload}, now)
     cur = conn.executemany(
-        """UPDATE listings SET price = ?, initial_price = COALESCE(initial_price, ?),
-           last_seen_at = ?,
-           reactivation_count = COALESCE(reactivation_count, 0) +
-               CASE WHEN status = 'missing' THEN 1 ELSE 0 END,
-           missing_detected_at = NULL, status = 'active' WHERE id = ?""",
+        "UPDATE listings SET price = ?, last_seen_at = ?, status = 'active' WHERE id = ?",
         payload,
     )
-    record_presence_events(conn, reactivations)
     return cur.rowcount if cur.rowcount and cur.rowcount > 0 else len(payload)
 
 
-def touch_seen(conn, seen_ids, now=None, observed_at_by_id=None):
+def touch_seen(conn, seen_ids, now=None):
     """
     Отмечает, что id реально видели на сайте, без изменения данных
     карточки. Нужно для id, у которых цена со страницы списка не
@@ -995,28 +633,10 @@ def touch_seen(conn, seen_ids, now=None, observed_at_by_id=None):
     now = now or utcnow_iso()
     if not seen_ids:
         return 0
-    observed_at_by_id = observed_at_by_id or {}
-    stored = _rows_by_id(conn, seen_ids)
-    payload = [
-        (observed_at_by_id.get(rid) or now, rid)
-        for rid in seen_ids
-        if rid in stored
-        if _timestamp(observed_at_by_id.get(rid) or now)
-        >= _timestamp(stored.get(rid, {}).get("last_seen_at"))
-    ]
-    reactivations = [
-        (rid, PRESENCE_REACTIVATED, "active", observed_at)
-        for observed_at, rid in payload
-        if stored.get(rid, {}).get("status") == "missing"
-    ]
     cur = conn.executemany(
-        """UPDATE listings SET last_seen_at = ?,
-           reactivation_count = COALESCE(reactivation_count, 0) +
-               CASE WHEN status = 'missing' THEN 1 ELSE 0 END,
-           missing_detected_at = NULL, status = 'active' WHERE id = ?""",
-        payload,
+        "UPDATE listings SET last_seen_at = ?, status = 'active' WHERE id = ?",
+        [(now, rid) for rid in seen_ids],
     )
-    record_presence_events(conn, reactivations)
     return cur.rowcount or 0
 
 
@@ -1040,7 +660,7 @@ def note_fetch_failure(conn, advert_id, error=""):
     )
 
 
-def mark_missing(conn, seen_ids, list_scan_complete, grace_seconds=None, now=None):
+def mark_missing(conn, seen_ids, list_scan_complete, grace_seconds=None):
     """
     seen_ids — id, реально увиденные в ЭТОМ прогоне.
 
@@ -1064,9 +684,8 @@ def mark_missing(conn, seen_ids, list_scan_complete, grace_seconds=None, now=Non
     Поэтому missing ставится только тем, кого не видели дольше
     grace_seconds. Один пропущенный обход прощается, два подряд — нет.
 
-    Ничего не удаляет, last_seen_at не трогает. Для нового перехода
-    сохраняет missing_detected_at; уже missing строки не обновляет.
-    Возвращает число вновь помеченных.
+    Ничего не удаляет, last_seen_at не трогает. Возвращает число вновь
+    помеченных.
     """
     if not list_scan_complete:
         return 0
@@ -1075,35 +694,22 @@ def mark_missing(conn, seen_ids, list_scan_complete, grace_seconds=None, now=Non
     if grace_seconds is None:
         grace_seconds = MISSING_GRACE_SECONDS
 
-    detected_at = now or utcnow_iso()
-    current = _timestamp(detected_at)
-    cutoff = (current - timedelta(seconds=grace_seconds)).isoformat(
+    cutoff = (datetime.now(timezone.utc) - timedelta(seconds=grace_seconds)).isoformat(
         timespec="seconds")
 
     conn.execute("CREATE TEMP TABLE IF NOT EXISTS seen_now (id TEXT PRIMARY KEY)")
     conn.execute("DELETE FROM seen_now")
     conn.executemany("INSERT OR IGNORE INTO seen_now (id) VALUES (?)", [(i,) for i in seen_ids])
-    targets = [row[0] for row in conn.execute(
-        """SELECT id FROM listings
-           WHERE status IS NOT 'missing'
-             AND id NOT IN (SELECT id FROM seen_now)
-             AND (last_seen_at IS NULL OR last_seen_at < ?)
-           ORDER BY id""",
-        (cutoff,),
-    )]
     cur = conn.execute(
         """
-        UPDATE listings SET status = 'missing', missing_detected_at = ?
+        UPDATE listings SET status = 'missing'
         WHERE status IS NOT 'missing'
           AND id NOT IN (SELECT id FROM seen_now)
           AND (last_seen_at IS NULL OR last_seen_at < ?)
         """,
-        (detected_at, cutoff),
+        (cutoff,),
     )
     marked = cur.rowcount or 0
-    record_presence_events(conn, [
-        (rid, PRESENCE_MISSING, "missing", detected_at) for rid in targets
-    ])
     conn.execute("DROP TABLE IF EXISTS seen_now")
     return marked
 
@@ -1149,41 +755,18 @@ def import_csv(conn, path=DETAIL_OUTPUT_CSV):
 
 
 def _import_batch(conn, batch):
-    """Import lifecycle and mark newly imported history as incomplete."""
+    """Импорт сохраняет исходные first_seen_at/last_seen_at/status как есть."""
     if not batch:
         return 0
-    imported_at = utcnow_iso()
-    existing_before = _rows_by_id(conn, batch)
     payload = []
-    bootstrap_presence = []
-    bootstrap_prices = []
     for rid, row in batch.items():
         row = dict(row)
         row["id"] = rid
         row["first_seen_at"] = row.get("first_seen_at") or utcnow_iso()
         row["last_seen_at"] = row.get("last_seen_at") or row["first_seen_at"]
         row["status"] = row.get("status") or "active"
-        row["initial_price"] = row.get("initial_price") or row.get("price")
-        row["price_drop_count"] = row.get("price_drop_count") or 0
-        row["reactivation_count"] = row.get("reactivation_count") or 0
         payload.append([_coerce(c, row.get(c)) for c in DETAIL_FIELDNAMES])
     conn.executemany(_upsert_sql(), payload)
-    for rid, row in batch.items():
-        if rid in existing_before:
-            continue
-        status = _coerce("status", row.get("status")) or "active"
-        presence_id = _source_event_id("presence-import-v1", rid)
-        bootstrap_presence.append(
-            (presence_id, rid, PRESENCE_BOOTSTRAP, status, imported_at, 0))
-        price = _coerce("initial_price", row.get("initial_price"))
-        if price is None:
-            price = _coerce("price", row.get("price"))
-        if price is not None:
-            price_id = _source_event_id("price-import-v1", rid)
-            bootstrap_prices.append(
-                (price_id, rid, imported_at, price, PRICE_BOOTSTRAP, 0))
-    _record_source_events(conn, "presence", bootstrap_presence)
-    _record_source_events(conn, "price", bootstrap_prices)
     return len(payload)
 
 

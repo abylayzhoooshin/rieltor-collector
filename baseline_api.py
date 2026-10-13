@@ -16,7 +16,6 @@ import os
 import time
 import secrets
 import sqlite3
-import re
 
 import master_db
 import paths
@@ -27,8 +26,6 @@ from fastapi.responses import JSONResponse
 
 BASELINE_DIR = paths.baseline_dir()
 LATEST_POINTER = os.path.join(BASELINE_DIR, "latest.json")
-CANDIDATE_DIR = paths.candidate_dir()
-CANDIDATE_POINTER = os.path.join(CANDIDATE_DIR, "candidate_latest.json")
 
 # Токен доступа. Пусто => проверка выключена (локальная отладка).
 # В проде задаётся переменной окружения; без него весь собранный
@@ -99,68 +96,6 @@ def _open_version(pointer):
     return conn
 
 
-def _read_candidate_pointer():
-    if not os.path.exists(CANDIDATE_POINTER):
-        return None
-    try:
-        with open(CANDIDATE_POINTER, "r", encoding="utf-8") as handle:
-            return json.load(handle)
-    except (json.JSONDecodeError, OSError):
-        return None
-
-
-def _open_candidate_version(version):
-    if not re.fullmatch(r"[0-9a-f]{16}", version or ""):
-        raise HTTPException(status_code=400, detail="некорректный candidate version")
-    path = os.path.abspath(os.path.join(CANDIDATE_DIR, f"candidate_{version}.db"))
-    if os.path.dirname(path) != os.path.abspath(CANDIDATE_DIR):
-        raise HTTPException(status_code=400, detail="некорректный candidate version")
-    if not os.path.exists(path):
-        raise HTTPException(
-            status_code=410,
-            detail="candidate version не найдена или удалена retention-политикой",
-        )
-    try:
-        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5.0)
-        conn.row_factory = sqlite3.Row
-        row = conn.execute(
-            "SELECT version,schema_version,hash_algorithm FROM meta").fetchone()
-        if (row is None or row["version"] != version
-                or row["schema_version"] != "candidate-v2"
-                or row["hash_algorithm"] != "sha256-canonical-jsonl-v1"):
-            conn.close()
-            raise HTTPException(status_code=500, detail="candidate version повреждена")
-        return conn
-    except sqlite3.Error as exc:
-        raise HTTPException(status_code=500, detail=f"candidate version не читается: {exc}")
-
-
-def _candidate_page(version, table_name, order_by, limit, offset):
-    conn = _open_candidate_version(version)
-    try:
-        total = conn.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()[0]
-        rows = [dict(row) for row in conn.execute(
-            f"SELECT * FROM {table_name} ORDER BY {order_by} LIMIT ? OFFSET ?",
-            (limit, offset),
-        )]
-        if table_name == "listings":
-            for row in rows:
-                urls = [item[0] for item in conn.execute(
-                    "SELECT photo_url FROM listing_photos "
-                    "WHERE listing_id=? ORDER BY photo_index", (row["id"],))]
-                row["photo_urls"] = json.dumps(
-                    urls, ensure_ascii=False, separators=(",", ":"))
-        return {
-            "version": version,
-            "total": total,
-            "limit": limit,
-            "offset": offset,
-            "rows": rows,
-        }
-    finally:
-        conn.close()
-
-
 @app.get("/baseline/meta", dependencies=[Depends(require_api_key)])
 def meta():
     pointer = _read_pointer()
@@ -203,58 +138,6 @@ def table(limit: int = Query(DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE),
         }
     finally:
         conn.close()
-
-
-@app.get("/baseline/candidates/meta", dependencies=[Depends(require_api_key)])
-def candidate_meta():
-    pointer = _read_candidate_pointer()
-    if pointer is None:
-        raise HTTPException(status_code=503, detail="candidate snapshot ещё не собран")
-    conn = _open_candidate_version(pointer.get("version"))
-    try:
-        row = conn.execute("SELECT * FROM meta").fetchone()
-        if row is None:
-            raise HTTPException(status_code=500, detail="candidate meta пуста")
-        result = dict(row)
-        if any(result.get(key) != pointer.get(key) for key in result):
-            raise HTTPException(
-                status_code=500, detail="candidate pointer и manifest не совпадают")
-        return result
-    finally:
-        conn.close()
-
-
-@app.get("/baseline/candidates/listings", dependencies=[Depends(require_api_key)])
-def candidate_listings(version: str = Query(...),
-                       limit: int = Query(DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE),
-                       offset: int = Query(0, ge=0)):
-    return _candidate_page(version, "listings", "id", limit, offset)
-
-
-@app.get("/baseline/candidates/photos", dependencies=[Depends(require_api_key)])
-def candidate_photos(version: str = Query(...),
-                     limit: int = Query(DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE),
-                     offset: int = Query(0, ge=0)):
-    return _candidate_page(
-        version, "listing_photos", "listing_id,photo_index", limit, offset)
-
-
-@app.get("/baseline/candidates/prices", dependencies=[Depends(require_api_key)])
-def candidate_prices(version: str = Query(...),
-                     limit: int = Query(DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE),
-                     offset: int = Query(0, ge=0)):
-    return _candidate_page(
-        version, "price_observations",
-        "listing_id,observed_at,source_event_id", limit, offset)
-
-
-@app.get("/baseline/candidates/presence", dependencies=[Depends(require_api_key)])
-def candidate_presence(version: str = Query(...),
-                       limit: int = Query(DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE),
-                       offset: int = Query(0, ge=0)):
-    return _candidate_page(
-        version, "presence_events",
-        "listing_id,observed_at,source_event_id", limit, offset)
 
 
 @app.get("/price-index", dependencies=[Depends(require_api_key)])
