@@ -1,7 +1,7 @@
 """
 Двухуровневый парсер объявлений Krisha.kz (slow track / full scan).
 
-Уровень 1 (список): страницы /arenda/kvartiry/astana/?page=N — id, цена и
+Уровень 1 (список): страницы /arenda/kvartiry/almaty/?page=N — id, цена и
     номер страницы каждого объявления (без захода в карточки).
 Уровень 2 (карточка): /a/show/{id} — два источника данных на одной странице:
     - window.data (JSON в <script id="jsdata">) — цена, площадь, комнаты, ЖК как
@@ -31,7 +31,7 @@ EXIT_OK / EXIT_BLOCKED / EXIT_LAYOUT_CHANGED / EXIT_NO_PAGES; при
 Запуск:
     python v2_krisha_pars_fixed.py list      # только уровень 1 (собрать ID)
     python v2_krisha_pars_fixed.py detail    # только уровень 2 (по снимку списка)
-    python v2_krisha_pars_fixed.py all       # оба уровня последовательно (по умолчанию)
+    python v2_krisha_pars_fixed.py all       # список и карточки параллельно (по умолчанию)
 """
 
 import asyncio
@@ -60,11 +60,14 @@ BASE_URL = "https://krisha.kz"
 
 # "arenda" — аренда (текущий пилот). "prodazha" — продажа (под методологию v3).
 CATEGORY = "arenda"
-CITY = "astana"
+# Форк астанинского сборщика под Алматы — единственное отличие уровня
+# сети от него: другой city-слаг в URL. Остальное (сеть, парсинг,
+# антибот) не зависит от города.
+CITY = "almaty"
 
 FETCH_URL = f"{BASE_URL}/{CATEGORY}/kvartiry/{CITY}/"
 
-LIST_OUTPUT_CSV = paths.data_path("krisha_astana_ids.csv")
+LIST_OUTPUT_CSV = paths.data_path("krisha_almaty_ids.csv")
 LIST_PROGRESS_FILE = paths.data_path("progress_list.json")
 
 # Итог обхода списка: был ли он ПОЛНЫМ (все страницы отдались). От этого
@@ -78,9 +81,7 @@ COOKIES_FILE = paths.data_path("krisha_cookies.json")
 # Ответ сайта, на котором full scan прервался (блокировка/смена разметки).
 BLOCKED_SAMPLE = paths.data_path("full_blocked_last.html")
 
-# Через сколько скачанных карточек сбрасывать их в базу одной транзакцией.
-# Компромисс между "потерять при обрыве" и "не дёргать диск на каждый id".
-DETAIL_FLUSH_EVERY = 10
+# Карточки сохраняются сразу, чтобы API и fast track видели обновления.
 
 # Ограничение на количество страниц списка для теста. None = без ограничения.
 MAX_PAGES = None
@@ -88,8 +89,8 @@ MAX_PAGES = None
 # Возраст снимка списка (list_meta.json), после которого его больше не
 # считаем свежим для права помечать missing — см. run_detail_stage.
 #
-# В штатном цикле это не срабатывает: уровень 2 стартует сразу после
-# уровня 1 в том же прогоне, разрыв — секунды. Защита нужна для НЕШТАТНЫХ
+# В штатном цикле список и карточки обрабатываются параллельно.
+# Защита также нужна для НЕШТАТНЫХ
 # случаев — например, ручной "python v2_krisha_pars_fixed.py detail" без
 # свежего "list" перед ним читает list_meta.json от старого, возможно
 # многодневной давности прогона. 1.5 интервала планового полного обхода
@@ -191,6 +192,44 @@ class LayoutChangedError(AbortRun):
     exit_code = EXIT_LAYOUT_CHANGED
 
 
+class RequestGate:
+    """Одна очередь запросов на общую сессию, включая ретраи обоих сборщиков.
+
+    Задачи работают параллельно, но IP получает прежнюю суммарную частоту.
+    FIFO-lock не даёт длинному обходу вытеснить запросы fast track.
+    """
+
+    def __init__(self):
+        self.lock = asyncio.Lock()
+        self.next_allowed = 0.0
+        self.blocked_until = 0.0
+        self.blocked_error = None
+
+    async def get(self, session, url, **kwargs):
+        async with self.lock:
+            if self.blocked_error is not None and time.time() < self.blocked_until:
+                raise self.blocked_error
+            # asyncio.sleep() may wake slightly early (notably on Windows).
+            # Re-check the monotonic deadline so RequestGate never shortens
+            # the configured anti-block spacing between request starts.
+            while True:
+                remaining = self.next_allowed - time.monotonic()
+                if remaining <= 0:
+                    break
+                await asyncio.sleep(remaining)
+            try:
+                resp = await session.get(url, **kwargs)
+                if (400 <= resp.status_code < 500 and resp.status_code not in NOT_FOUND_STATUSES
+                        or resp.status_code == 200 and is_antibot_page(resp)):
+                    self.blocked_error = BlockedError(f"Блокировка на {url}", resp)
+                    self.blocked_until = time.time() + float(os.environ.get("BLOCKED_COOLDOWN_MIN", "90")) * 60
+                    raise self.blocked_error
+                return resp
+            finally:
+                delays = (DETAIL_DELAY_MIN, DETAIL_DELAY_MAX) if "/a/show/" in url else (DELAY_MIN, DELAY_MAX)
+                self.next_allowed = time.monotonic() + random.uniform(*delays)
+
+
 def page_url(page_num):
     # Браузер открывает первую страницу без ?page=1.
     return FETCH_URL if page_num == 1 else f"{FETCH_URL}?page={page_num}"
@@ -212,6 +251,7 @@ def _new_session(cookies_path=COOKIES_FILE):
         curl_options={CurlOpt.HTTPHEADER_ORDER: HEADER_ORDER},
     )
     load_cookies(session, cookies_path)
+    session.collector_gate = RequestGate()
     return session
 
 
@@ -229,7 +269,10 @@ async def fetch_url(session, url, referer=None):
     headers = {"Referer": referer, "Sec-Fetch-Site": "same-origin"} if referer else None
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            resp = await session.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+            gate = getattr(session, "collector_gate", None)
+            if gate is None:
+                gate = session.collector_gate = RequestGate()
+            resp = await gate.get(session, url, headers=headers, timeout=REQUEST_TIMEOUT)
         except CurlRequestError as e:
             print(f"   ⚠️  {url}: ошибка {e!r} (попытка {attempt}/{MAX_RETRIES})")
         else:
@@ -374,7 +417,7 @@ def parse_listing_page(html, page_num):
             "url": advert_url(advert_id),
             "price": parse_card_price(card),
             "page_number": page_num,
-            "scraped_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "scraped_at": master_db.utcnow_iso(),
         }
     return rows
 
@@ -412,7 +455,7 @@ def _mark_list_aborted(reason):
     })
 
 
-async def run_list_stage(session):
+async def run_list_stage(session, on_rows=None):
     """
     Обходит ВСЕ страницы списка заново при каждом вызове — чтобы поймать и
     новые объявления, и те, что успели пропасть.
@@ -437,9 +480,10 @@ async def run_list_stage(session):
     else:
         print(f"↪️  Обнаружен незавершённый прошлый прогон, продолжаю с этого места (по {LIST_PROGRESS_FILE})")
 
+    _mark_list_aborted("обход списка выполняется")
     try:
-        return await _walk_list(session, progress)
-    except AbortRun as e:
+        return await _walk_list(session, progress, on_rows=on_rows)
+    except BaseException as e:
         _mark_list_aborted(str(e))
         raise
 
@@ -450,7 +494,7 @@ def _raise_for_empty_list_page(resp, page_num):
     raise LayoutChangedError(f"страница {page_num}: нет карточек", resp)
 
 
-async def _walk_list(session, progress):
+async def _walk_list(session, progress, on_rows=None):
     start_page = progress.get("last_completed_page", 0) + 1
 
     print("Запрашиваю первую страницу, чтобы узнать общее число страниц...")
@@ -476,6 +520,8 @@ async def _walk_list(session, progress):
         with open(LIST_OUTPUT_CSV, "r", encoding="utf-8-sig") as f:
             for row in csv.DictReader(f):
                 collected[row["id"]] = row
+        if on_rows:
+            await on_rows(collected)
 
     # Страницы, которые так и не отдались. Пока этот список непустой,
     # снепшот НЕПОЛНЫЙ, и делать вывод "объявление пропало с сайта" по
@@ -493,6 +539,8 @@ async def _walk_list(session, progress):
         _write_list_csv(collected)
         progress["last_completed_page"] = 1
         save_progress(LIST_PROGRESS_FILE, progress)
+        if on_rows:
+            await on_rows(rows)
         start_page = 2
 
     for page_num in range(start_page, total_pages + 1):
@@ -517,6 +565,8 @@ async def _walk_list(session, progress):
             print(f"   📄 Страница {page_num}/{total_pages}: найдено {len(rows)} ID")
             progress["last_completed_page"] = page_num
             _write_list_csv(collected)
+            if on_rows:
+                await on_rows(rows)
         progress["skipped_pages"] = skipped_pages
         save_progress(LIST_PROGRESS_FILE, progress)
 
@@ -691,7 +741,7 @@ def parse_detail_page(html, advert_id):
         "created_at": advert_extra.get("createdAt"),
         "added_at": advert_extra.get("addedAt"),
         "storage": advert.get("storage"),
-        "scraped_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "scraped_at": master_db.utcnow_iso(),
     }
 
 
@@ -717,15 +767,19 @@ def parse_card(resp, advert_id):
 
 async def _detail_worker(queue, session, state):
     """
-    Один воркер из пула DETAIL_CONCURRENCY. Берёт ID из общей очереди,
-    качает карточку и копит её для записи в базу. Свою "человеческую"
-    задержку выдерживает между СВОИМИ запросами.
+    Берёт ID из очереди страниц и сразу сохраняет загруженную карточку.
+    Общая пауза запросов всех задач обеспечивается RequestGate.
     """
     while True:
-        try:
-            advert_id = queue.get_nowait()
-        except asyncio.QueueEmpty:
-            return
+        if state.get("streaming"):
+            advert_id = await queue.get()
+            if advert_id is None:
+                return
+        else:
+            try:
+                advert_id = queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return
 
         async with state["lock"]:
             if state["abort"]:
@@ -736,6 +790,12 @@ async def _detail_worker(queue, session, state):
         if cooldown > 0:
             await asyncio.sleep(cooldown)
 
+        # Пока ID ждал очереди, карточку мог уже сохранить fast track.
+        with master_db.connect() as conn:
+            stored = master_db.get_row(conn, advert_id)
+            if (master_db.is_complete(stored)
+                    and advert_id not in master_db.needs_refetch_ids(conn, [advert_id])):
+                continue
         resp = await fetch_url(session, advert_url(advert_id), referer=state["referers"].get(advert_id))
         row = parse_card(resp, advert_id) if resp is not None else None
 
@@ -784,7 +844,9 @@ async def _detail_worker(queue, session, state):
                     state["fresh"][advert_id] = row
                     state["done"] += 1
 
-                if len(state["fresh"]) >= DETAIL_FLUSH_EVERY:
+                # Сохраняем сразу: API и второй сборщик видят результат,
+                # даже если обход ещё ждёт следующую страницу.
+                if state["fresh"]:
                     _flush(state)
                 if (state["done"] + state["failed"]) % 20 == 0:
                     print(
@@ -819,6 +881,85 @@ def _referer_for(row):
         return FETCH_URL
 
 
+def _detail_state(referers=None, total=0, streaming=False):
+    return {
+        "lock": asyncio.Lock(), "referers": referers or {}, "streaming": streaming,
+        "fresh": {}, "failures": [], "bad_streak": [], "done": 0,
+        "failed": 0, "written": 0, "total": total,
+        "consecutive_failures": 0, "breaker_until": None,
+        "breaker_trips": 0, "abort": False,
+    }
+
+
+def _apply_list_rows(rows):
+    """Сразу обновить цены страницы и вернуть ID, которым нужна карточка."""
+    prices = {rid: row.get("price") for rid, row in rows.items()}
+    observed_at = {rid: row.get("scraped_at") for rid, row in rows.items()}
+    with master_db.connect() as conn:
+        master_db.upsert_price_only(conn, prices, observed_at_by_id=observed_at)
+        master_db.touch_seen(conn, [rid for rid, price in prices.items() if price in (None, "")],
+                             observed_at_by_id=observed_at)
+        known = master_db.existing_ids(conn)
+        refetch = master_db.needs_refetch_ids(conn, rows)
+        gave_up = master_db.giving_up_ids(conn)
+    return [rid for rid in rows if (rid not in known and rid not in gave_up) or rid in refetch]
+
+
+def _finish_snapshot(list_ids):
+    """Missing разрешён только по завершённому свежему снимку списка."""
+    meta = load_progress(LIST_META_FILE)
+    complete = bool(meta.get("complete"))
+    try:
+        finished = datetime.fromisoformat(meta.get("finished_at", "").replace("Z", "+00:00"))
+        if finished.tzinfo is None:
+            finished = finished.replace(tzinfo=timezone.utc)
+        complete = complete and (datetime.now(timezone.utc) - finished).total_seconds() <= LIST_SNAPSHOT_MAX_AGE_S
+    except (ValueError, TypeError, AttributeError):
+        complete = False
+    with master_db.connect() as conn:
+        missing = master_db.mark_missing(conn, set(list_ids), list_scan_complete=complete)
+        stats = master_db.stats(conn)
+    print(f"📊 База: всего {stats['total']}, active {stats['active']}, missing {stats['missing']}; "
+          f"помечено missing: {missing}, снимок полный и свежий: {complete}")
+    return stats
+
+
+async def run_streaming_scan(session):
+    """Страницы производят очередь карточек; обработка начинается с первой страницы."""
+    queue = asyncio.Queue()
+    state = _detail_state(streaming=True)
+    queued = set()
+    snapshot = None
+    worker_count = max(1, DETAIL_CONCURRENCY)
+
+    async def on_rows(rows):
+        for rid in _apply_list_rows(rows):
+            if rid not in queued:
+                queued.add(rid)
+                state["referers"][rid] = _referer_for(rows[rid])
+                state["total"] += 1
+                queue.put_nowait(rid)
+
+    async def produce():
+        nonlocal snapshot
+        snapshot = await run_list_stage(session, on_rows=on_rows)
+        for _ in range(worker_count):
+            queue.put_nowait(None)
+
+    tasks = [asyncio.create_task(produce())]
+    tasks.extend(asyncio.create_task(_detail_worker(queue, session, state)) for _ in range(worker_count))
+    try:
+        await gather_workers(tasks)
+        state["failures"].extend(state["bad_streak"])
+    finally:
+        _flush(state)
+        if snapshot is not None:
+            _finish_snapshot(snapshot)
+        print(f"📄 Full scan: карточек сохранено {state['written']}, "
+              f"не удалось загрузить {state['failed']}, поставлено в очередь {state['total']}")
+    return EXIT_OK if snapshot is not None else EXIT_NO_PAGES
+
+
 async def run_detail_stage(session):
     """
     Уровень 2: полные карточки.
@@ -827,6 +968,7 @@ async def run_detail_stage(session):
         - id из списка, которых в базе нет вообще (новые);
         - id, которые в базе есть, но карточка НЕПОЛНАЯ. Попытки считаются,
           после MAX_FETCH_ATTEMPTS объявление перестаёт мешаться.
+        - устаревшие карточки после снижения цены, включая очередь повторов.
     Известным полным id патчим только цену — прямо из list-скана, без
     единого detail-запроса.
 
@@ -886,10 +1028,16 @@ async def run_detail_stage(session):
             for i in list_ids
             if i in known and i not in refetch
         }
-        patched = master_db.upsert_price_only(conn, price_only)
+        observed_at = {row["id"]: row.get("scraped_at") for row in list_rows}
+        patched = master_db.upsert_price_only(conn, price_only, observed_at_by_id=observed_at)
+        # Патч цены мог поставить устаревшие фото в очередь. Подхватываем
+        # их в этом же обходе; при сбое очередь остаётся в SQLite.
+        refetch = master_db.needs_refetch_ids(conn, candidate_ids=list_ids)
+        refetch_ids = [i for i in list_ids if i in refetch]
         # id, у которых цена со страницы не распозналась, тоже надо
         # отметить как виденные — иначе они выглядят "давно не видели".
-        master_db.touch_seen(conn, [i for i, p in price_only.items() if p in (None, "")])
+        master_db.touch_seen(conn, [i for i, p in price_only.items() if p in (None, "")],
+                             observed_at_by_id=observed_at)
 
     todo_ids = list(dict.fromkeys(new_ids + refetch_ids))
 
@@ -906,21 +1054,7 @@ async def run_detail_stage(session):
     for advert_id in todo_ids:
         queue.put_nowait(advert_id)
 
-    state = {
-        "lock": asyncio.Lock(),
-        "referers": referers,
-        "fresh": {},
-        "failures": [],
-        "bad_streak": [],
-        "done": 0,
-        "failed": 0,
-        "written": 0,
-        "total": len(todo_ids),
-        "consecutive_failures": 0,
-        "breaker_until": None,
-        "breaker_trips": 0,
-        "abort": False,
-    }
+    state = _detail_state(referers, len(todo_ids))
 
     workers = [
         asyncio.create_task(_detail_worker(queue, session, state))
@@ -974,9 +1108,9 @@ async def run_cycle(stage="all", session=None, cookies_path=COOKIES_FILE):
     вызывать снова и снова.
 
     Возвращает код: EXIT_OK, EXIT_BLOCKED, EXIT_LAYOUT_CHANGED или
-    EXIT_NO_PAGES (не загрузилась первая страница списка). После
-    неудачного уровня 1 карточки не качаются: сайт недоступен или не
-    пускает, лишние запросы только усугубят.
+    EXIT_NO_PAGES (не загрузилась первая страница списка). В режиме all
+    карточки обрабатываются во время обхода; при сбое одной стадии
+    вторая отменяется, уже сохранённые карточки остаются в базе.
 
     Можно передать свою сессию (оркестратор держит одну на весь процесс) —
     тогда она не будет закрыта в конце функции.
@@ -986,10 +1120,12 @@ async def run_cycle(stage="all", session=None, cookies_path=COOKIES_FILE):
         session = _new_session(cookies_path)
     burned = False
     try:
-        if stage in ("list", "all"):
+        if stage == "all":
+            return await run_streaming_scan(session)
+        if stage == "list":
             if await run_list_stage(session) is None:
                 return EXIT_NO_PAGES
-        if stage in ("detail", "all"):
+        if stage == "detail":
             await run_detail_stage(session)
         return EXIT_OK
     except AbortRun as e:

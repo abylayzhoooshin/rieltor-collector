@@ -6,7 +6,11 @@ Note: source comments and the README are written in Russian; this file is in Eng
 
 ## What this is
 
-A microservice that scrapes rental listings from krisha.kz (Astana), cleans/dedupes them, and publishes a versioned "baseline" dataset over HTTP for a separate price-estimation bot to consume. One process runs both the scraping schedule and the HTTP API concurrently in a single asyncio event loop (`service.py`).
+A microservice that scrapes rental listings from krisha.kz (Almaty — this is a fork of a sibling Astana rental collector, repurposed for a different city), cleans/dedupes them, and publishes a versioned "baseline" dataset over HTTP for a separate price-estimation bot to consume. One process runs both the scraping schedule and the HTTP API concurrently in a single asyncio event loop (`service.py`).
+
+Carried over unchanged from the Astana version: dedup logic (`dedupe_baseline.py`), the network/anti-detection layer, the event log, the whole orchestrator — none of it is city-specific. Recalibrated for Almaty: `CITY = "almaty"` in `v2_krisha_pars_fixed.py`, and the city sanity-filter bounds `ALMATY_LAT_RANGE/LON_RANGE` + `CITY_ALIASES` in `build_baseline.py`. `price_index.py` (BNS rent-index-based price-over-time adjustment) is NOT calibrated for Almaty — the original `official_rent_index.json` was Astana-only data and has been renamed out (`.unused_astana_index`) so the module falls back to its safe `measured=false` default instead of silently misapplying Astana's index to Almaty prices.
+
+Deployed to a different Render region (`singapore`, not `frankfurt`) than the two Astana siblings (rental + sale) specifically so its outbound traffic doesn't share their IP pool — see `render.yaml` comment.
 
 ## Commands
 
@@ -39,16 +43,19 @@ curl http://localhost:8001/health
 curl http://localhost:8001/baseline/meta
 ```
 
-There is no test suite, linter, or type-checker configured in this repo — don't invent commands for them.
+Local regression tests use the standard library: `python -m unittest -q test_photo_refresh test_collector_concurrency`. They use temporary databases and mocked network responses. No linter or type-checker is configured.
 
 Docker: `docker build .` then `docker run` (see `Dockerfile`); `CMD` is `python service.py`. Deploy target is Render via `render.yaml` (Blueprint, paid plan required — see comments in that file for why: persistent disk + always-on background scraping).
 
 ## Architecture
 
-### Two-layer data model
+### Three-layer data model
 
 - `master_db.listings` (SQLite, `master_db.py`) — the full archive. Rows are **never deleted**; a listing that disappears from the site gets `status='missing'` instead. This is the single source of truth both scrapers write into.
 - `baseline_<version>.db` files in `BASELINE_DIR` (`build_baseline.py`) — what the API serves: `master_db` rows after sanity-filtering + de-duplication. Each version file is **immutable once written**; publishing swaps a small `latest.json` pointer atomically (`os.replace`). This makes the "collector writes / API reads" race structurally impossible rather than merely unlikely — the API only ever opens the exact file `latest.json` names, and that file never changes after creation.
+- `candidate_<version>.db` files in `CANDIDATE_DIR` (`build_candidates.py`) — the Cleaner contract before business filtering and deduplication. It exports technically valid active+missing listings, ordered photos, price observations and presence events from one SQLite read transaction, with an independent pointer and retention policy.
+
+`schema_migrations` owns ordered idempotent migrations. Bootstrap history uses `history_complete=0`; live facts use `history_complete=1`. Stable `source_event_id` values are deterministic, and price `observed_at` is the actual list/detail observation time. Live presence is transition-only: `first_seen`, `missing_confirmed`, and `reactivated` (`bootstrap_state` is migration-only; `seen` remains a compatibility type but routine active observations only update `last_seen_at`).
 
 ### Process layout (`service.py`)
 
@@ -60,13 +67,14 @@ If either coroutine raises, the whole process dies (by design — better than ha
 
 ### The scheduler (`orchestrator.py`)
 
-Runs three jobs **strictly sequentially in a single loop**, never concurrently — both scrapers hit the same site from the same IP, and krisha.kz has banned this IP before (HTTP 468) when request patterns got too dense/regular:
+Full scan and fast track run concurrently in independent `Orchestrator._scan_loop` tasks, with at most one run of each kind. They share one session and its `RequestGate`: actual HTTP requests, including retries, are serialized with global list/detail delays. Do not bypass this gate — the IP has previously been blocked for dense request patterns. The gate immediately rejects all peers' requests after a block; the scheduler persists `blocked_until` and postpones both schedules, including across restarts. Baseline rebuild stays in its own `_build_loop` without network access, so publishing and health checks do not wait for scans.
 
-1. **Full scan** (`v2_krisha_pars_fixed.run_cycle`) — every ~2h (jittered, 1.75-2.25h). Walks every list page, fetches full detail cards for any id that's missing or incomplete. This is the only job allowed to mark listings `missing` (`master_db.mark_missing`), and only when the list walk completed without skipped pages — a partial walk would otherwise wrongly disappear whole pages of live listings. It also applies `MISSING_GRACE_S`: a listing must be absent for longer than one scan interval before being marked missing, because krisha's list is sorted by date and a listing can drift to a later page mid-walk.
-2. **Baseline rebuild** (`build_baseline.build`) — every `BASELINE_BUILD_INTERVAL_MIN` (default 30 min). Deliberately decoupled from full scan completion: publishing depends only on `master_db` contents, not on whether the scan finished.
-3. **Fast track** (`fast_track.run`) — every ~5 min (jittered, 4-6 min). Scans only the first `FAST_LIST_MAX_PAGES` (3) list pages (price is already in the list markup, no detail fetch needed) to catch new listings and price drops quickly. Fetches full detail cards only for genuinely new ids; price drops are patched cheaply via `master_db.upsert_price_only` without a detail request. Never marks anything missing — its window is too narrow to conclude a listing is gone.
+1. **Full scan** (`v2_krisha_pars_fixed.run_cycle`) — every ~1h (jittered, 0.9-1.1h / 54-66 minutes). Walks every list page, fetches full detail cards for any id that's missing or incomplete. This is the only job allowed to mark listings `missing` (`master_db.mark_missing`), and only when the list walk completed without skipped pages — a partial walk would otherwise wrongly disappear whole pages of live listings. It also applies `MISSING_GRACE_S` (still 6 hours by default), because krisha's list is sorted by date and a listing can drift to a later page mid-walk.
+2. **Baseline rebuild** (`build_baseline.build`) — every `BASELINE_BUILD_INTERVAL_MIN` (default 30 min), on its own concurrent loop (see above). Also deliberately decoupled from full scan *completion*: publishing depends only on `master_db` contents, not on whether the scan finished.
+3. **Candidate rebuild** (`build_candidates.build`) — every `CANDIDATE_BUILD_INTERVAL_MIN` (default 30 min), on a separate persisted timer. It performs no Krisha requests and does not replace the legacy baseline path.
+4. **Fast track** (`fast_track.run`) — every ~5 min (jittered, 4-6 min), even while full scan is running. Scans the first `FAST_LIST_MAX_PAGES` (3) list pages. Fetches new/incomplete cards and stale cards on price drops (`PRICE_DROP_DETAIL_MAX_AGE_HOURS`, default 24), including retries from `detail_refresh_queue`. Successful refreshes update `photo_urls`, `photo_count`, and `photo_set_hash`. Never marks anything missing.
 
-The 5-min cadence is safe specifically because only detail-card fetches have ever triggered a block on this site — list-page scans (id+price only) never have. At steady state (~150 new listings/day) a 5-min fast-track window sees on average 0.5 new ids, so card-fetch volume at this cadence is far below what caused the earlier ban. Full scan's own detail-stage backlog (currently large due to historical seeding) can make its FIRST few runs after a fresh deploy take much longer than 2h — that's expected to shrink to ~10-20 min/run once the backlog clears; don't be alarmed if fast track appears starved for the first day.
+Full scan's detail backlog can still take hours, but no longer starves fast track. In `run_cycle("all")`, `run_streaming_scan` starts list production and detail consumers together. Each page updates known prices immediately and queues required cards; each successful card is committed immediately. The list CSV/progress still supports resume after interruption. Only a complete fresh snapshot permits marking missing. Cancelling either stage cancels and awaits its peers. Timestamp guards in `master_db` prevent delayed list/detail batches from reverting newer observations written by the other scraper.
 
 Both scrapers return an exit code (`EXIT_OK=0`, `EXIT_BLOCKED=2`, `EXIT_LAYOUT_CHANGED=3`, `EXIT_NO_PAGES=4`, defined in `v2_krisha_pars_fixed.py`) instead of raising. `run_task` treats `EXIT_BLOCKED` by pushing both `next_full` and `next_fast` out by `BLOCKED_COOLDOWN_MIN` — don't turn a block into an exception, since exceptions reschedule after only `FAILURE_BACKOFF_MIN` (15 min) and would hit the site again during the ban.
 
@@ -101,6 +109,8 @@ Adjusts historical prices to "today's terms" using the **official BNS (Kazakhsta
 ### API (`baseline_api.py`)
 
 FastAPI app reading `latest.json` + the version file it points to (read-only SQLite connections, `mode=ro`). Endpoints: `/health` (no auth, three states: `starting`/`ok`/`stale`-or-`broken` — see the docstring for why "no baseline yet" is 200 not 503 during first-run cold start), `/baseline/meta`, `/baseline/table` (paginated, `limit`≤500; check `total`/`version` on every page since a version can flip mid-walk), `/price-index`. All non-`/health` routes require header `X-API-Key` if `BASELINE_API_KEY` is set (empty = auth disabled, intended for local dev only).
+
+Candidate endpoints are `/baseline/candidates/meta` plus explicit-version `listings`, `photos`, `prices`, and `presence`. A removed version returns HTTP 410 and never falls back to latest. Legacy API remains available during migration.
 
 `/listings/changes?since=<event_id>&limit=<n>` and `/listings/{id}` are the odd ones out: unlike every other endpoint here, they read `master_db` directly (via `master_db.connect()`), not a frozen baseline version — this is deliberate, since external consumers (see "Event log" below) need near-real-time data, not data that's up to `BASELINE_BUILD_INTERVAL_MIN` stale. This is the only place `baseline_api.py` touches the live, concurrently-written DB; it relies on WAL mode's reader/writer concurrency, same as everywhere else in this codebase.
 

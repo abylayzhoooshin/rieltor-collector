@@ -23,7 +23,7 @@ import sys
 
 import aiohttp
 
-LIST_URL = "https://krisha.kz/arenda/kvartiry/astana/"
+LIST_URL = "https://krisha.kz/arenda/kvartiry/almaty/"
 CARD_URL = "https://krisha.kz/a/show/{}"
 PAUSE = 5.0
 BODY_CHARS = 400

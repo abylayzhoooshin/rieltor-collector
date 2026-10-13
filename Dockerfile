@@ -15,7 +15,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-# Данные (krisha_astana.db, baseline_versions/) живут в /app/data —
+# Данные (krisha_almaty.db, baseline_versions/) живут в /app/data —
 # на Koyeb сюда монтируется Volume (см. инструкцию по деплою). Без
 # volume каталог всё равно создастся и будет работать, но исчезнет
 # при каждом рестарте контейнера — это ожидаемо для локальной отладки,
@@ -24,7 +24,7 @@ COPY . .
 # было, и вне render.yaml все восемь файлов состояния уезжали в
 # эфемерный /app.
 ENV DATA_DIR=/app/data
-ENV KRISHA_DB=/app/data/krisha_astana.db
+ENV KRISHA_DB=/app/data/krisha_almaty.db
 ENV BASELINE_DIR=/app/data/baseline_versions
 RUN mkdir -p /app/data
 

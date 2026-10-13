@@ -11,20 +11,18 @@
       первые страницы списка, ловит новые объявления и падения цены
       раньше, чем до них дойдёт следующий полный обход.
 
-ПОЧЕМУ СТРОГО ПО ОЧЕРЕДИ. Оба воркера ходят на один и тот же сайт с
-одного IP, и главный дефицитный ресурс здесь — не время, а терпение
-krisha.kz (бан по IP уже случался, см. комментарий к DETAIL_CONCURRENCY).
-Поэтому оркестратор НИКОГДА не держит два воркера одновременно: цикл
-последовательный, и суммарная нагрузка на сайт равна нагрузке одного
-воркера — ровно той, что задана паузами в самих модулях. Никаких
-собственных запросов оркестратор не делает и никаких задержек не
-переопределяет.
+ПАРАЛЛЕЛЬНЫЕ РАСПИСАНИЯ. Full scan и fast track работают независимо,
+но каждый — не более чем в одном экземпляре. Длинный полный обход
+не задерживает fast track. Внутри full scan страницы сразу обновляют
+цены и передают нужные карточки фоновому обработчику.
 
-Следствие: пока идёт полный обход (он может длиться часами), fast track
-не запускается. Это осознанный размен — приоритет у полноты базы, а не у
-скорости реакции. После обхода fast track догоняет одним прогоном, и
-карточки, которые за это время успел собрать full scan, повторно не
-качает.
+ОБЩАЯ НАГРУЗКА. Одна сессия и RequestGate в сетевом слое сериализуют
+HTTP-запросы всех задач и их ретраи с общими паузами. При блокировке
+gate немедленно прекращает запросы остальных задач, а оркестратор
+сохраняет общий cooldown для следующих запусков и рестартов.
+
+BUILD BASELINE работает в отдельной петле без сетевых запросов,
+чтобы публикация и /health не зависели от длительности обхода.
 
 СОСТОЯНИЕ. Времена следующих запусков лежат в ORCH_STATE_FILE, поэтому
 рестарт процесса (или перезагрузка машины) не приводит к внеочередному
@@ -60,22 +58,18 @@ import fast_track
 import master_db
 import v2_krisha_pars_fixed as full_scan
 import build_baseline
+import build_candidates
 import paths
 
 # ============================== CONFIG ==============================
 
-# Как часто делать ПОЛНЫЙ обход всех страниц. 2 часа = 12 полных среза
-# рынка в сутки. Раньше стоял более редкий интервал (5.5ч) — до того, как
-# выяснилось, что банят конкретно карточки объявлений, а не список
-# (id+цена) и не сама частота обхода. Список стабильно НЕ банился ни разу
-# за всё время наблюдений, поэтому гонять его чаще безопасно; ограничение
-# на карточки живёт отдельно — в паузах DETAIL_DELAY_MIN/MAX и
-# DETAIL_CONCURRENCY в v2_krisha_pars_fixed.py, они не завязаны на то, как
-# часто запускается сам обход.
+# Полный обход — примерно раз в час (54–66 минут). Если текущий обход
+# ещё работает, второй экземпляр не запускается. Общий RequestGate
+# сохраняет паузы между запросами независимо от частоты запусков.
 #
 # Фактический момент запуска разбрасывается в schedule() (см. span ниже),
 # поэтому здесь именно СРЕДНЕЕ, а не жёсткое значение.
-FULL_SCAN_INTERVAL_H = float(os.environ.get("FULL_SCAN_INTERVAL_H", "2"))
+FULL_SCAN_INTERVAL_H = float(os.environ.get("FULL_SCAN_INTERVAL_H", "1"))
 
 # Как часто крутить окно первых FAST_LIST_MAX_PAGES страниц.
 FAST_INTERVAL_MIN = float(os.environ.get("FAST_INTERVAL_MIN", "5"))
@@ -101,6 +95,11 @@ FAST_INTERVAL_MIN = float(os.environ.get("FAST_INTERVAL_MIN", "5"))
 # master_db есть всегда, а обход может быть прерван рестартом.
 BASELINE_BUILD_INTERVAL_MIN = float(os.environ.get("BASELINE_BUILD_INTERVAL_MIN", "30"))
 
+# Candidate snapshot has its own persisted timer. It never calls Krisha and
+# does not alter the legacy baseline cadence.
+CANDIDATE_BUILD_INTERVAL_MIN = float(
+    os.environ.get("CANDIDATE_BUILD_INTERVAL_MIN", "30"))
+
 # ДИАПАЗОНЫ запуска задаются явно, а не одной долей разброса — единый
 # процент не даёт попасть в оба целевых окна сразу (проверено на старых
 # значениях 50-70мин/5-6ч: при общем 16.7% полный обход расползался до
@@ -114,8 +113,8 @@ FAST_INTERVAL_MIN_MAX = float(os.environ.get("FAST_INTERVAL_MIN_MAX", "6"))
 # редеплой будет тянуть полный обход.
 FORCE_SCAN_ON_START = os.environ.get("FORCE_SCAN_ON_START", "0") in ("1", "true", "True")
 
-FULL_SCAN_INTERVAL_H_MIN = float(os.environ.get("FULL_SCAN_INTERVAL_H_MIN", "1.75"))
-FULL_SCAN_INTERVAL_H_MAX = float(os.environ.get("FULL_SCAN_INTERVAL_H_MAX", "2.25"))
+FULL_SCAN_INTERVAL_H_MIN = float(os.environ.get("FULL_SCAN_INTERVAL_H_MIN", "0.9"))
+FULL_SCAN_INTERVAL_H_MAX = float(os.environ.get("FULL_SCAN_INTERVAL_H_MAX", "1.1"))
 
 # Запускать ли fast track вообще. Базу целиком собирает full scan; fast
 # track нужен, только если хочется ловить новые объявления в течение
@@ -234,17 +233,28 @@ async def run_build_baseline(session=None):
     log(f"✅ baseline version={version}, rows={rows}")
 
 
+async def run_build_candidates(session=None):
+    """Build the immutable pre-dedupe snapshot without network access."""
+    manifest = await asyncio.to_thread(build_candidates.build)
+    log(
+        f"✅ candidate version={manifest['version']}, "
+        f"rows={manifest['listings_total']}"
+    )
+
+
 async def run_fast_track(session):
     log("▶️  FAST TRACK старт")
     started = time.time()
-    await fast_track.run(
+    code = await fast_track.run(
         fast_track.FAST_KNOWN_IDS_FILE,
         fast_track.FAST_NEW_LISTINGS_CSV,
         fast_track.FAST_LIST_MAX_PAGES,
         fast_track.FAST_DETAIL_CONCURRENCY,
         session=session,
     )
+    log_exit("FAST TRACK", code)
     log(f"⏹  FAST TRACK завершён за {human(time.time() - started)}")
+    return code
 
 
 # ============================== ЦИКЛ ==============================
@@ -281,10 +291,13 @@ class Orchestrator:
         if span:
             interval_s = random.uniform(span[0], span[1])
         self.state[key] = time.time() + interval_s
+        if key in ("next_full", "next_fast"):
+            self.state[key] = max(self.state[key], self.state.get("blocked_until", 0))
         save_state(self.state)
 
     def postpone_after_block(self):
         until = time.time() + BLOCKED_COOLDOWN_MIN * 60
+        self.state["blocked_until"] = max(until, self.state.get("blocked_until", 0))
         for key in ("next_full", "next_fast"):
             if self.state.get(key, 0) < until:
                 self.state[key] = until
@@ -322,6 +335,7 @@ class Orchestrator:
         full_interval = FULL_SCAN_INTERVAL_H * 3600
         fast_interval = FAST_INTERVAL_MIN * 60
         build_interval = BASELINE_BUILD_INTERVAL_MIN * 60
+        candidate_interval = CANDIDATE_BUILD_INTERVAL_MIN * 60
         full_span = (FULL_SCAN_INTERVAL_H_MIN * 3600, FULL_SCAN_INTERVAL_H_MAX * 3600)
         fast_span = (FAST_INTERVAL_MIN_MIN * 60, FAST_INTERVAL_MIN_MAX * 60)
 
@@ -350,9 +364,11 @@ class Orchestrator:
             # Warmup fast track: если файла состояния ещё нет, первый
             # прогон обязан быть warmup — иначе все объявления, что уже
             # висят на сайте, разом уедут в вывод как "новые".
-            if ENABLE_FAST_TRACK and not os.path.exists(fast_track.FAST_KNOWN_IDS_FILE):
+            if (ENABLE_FAST_TRACK and not os.path.exists(fast_track.FAST_KNOWN_IDS_FILE)
+                    and time.time() >= self.state.get("blocked_until", 0)):
                 log("↪️  fast_known_ids.json не найден — делаю warmup-прогон fast track.")
                 code = None
+                self.schedule("next_fast", fast_interval, span=fast_span)
                 try:
                     code = await fast_track.run(
                         fast_track.FAST_KNOWN_IDS_FILE,
@@ -365,7 +381,6 @@ class Orchestrator:
                     log_exit("FAST TRACK warmup", code)
                 except Exception:
                     log(f"❌ warmup не удался:\n{traceback.format_exc()}")
-                self.schedule("next_fast", fast_interval, span=fast_span)
                 if code == full_scan.EXIT_BLOCKED:
                     self.postpone_after_block()
 
@@ -381,54 +396,73 @@ class Orchestrator:
             # после проверки, иначе КАЖДЫЙ рестарт будет запускать
             # полный обход — а это лишняя нагрузка на источник, из-за
             # которой и прилетала блокировка.
-            if FORCE_SCAN_ON_START:
+            if FORCE_SCAN_ON_START and time.time() >= self.state.get("blocked_until", 0):
                 log("⚡ FORCE_SCAN_ON_START=1 — запускаю полный обход немедленно, "
                     "не дожидаясь расписания.")
                 self.state.pop("next_full", None)
                 save_state(self.state)
 
-            while not self.stopping:
-                # Полный обход приоритетнее: он и есть сборщик базы.
-                if self.due("next_full", full_interval):
-                    await self.run_task(
-                        "FULL SCAN", "next_full", full_interval, run_full_scan, session,
-                        span=full_span
-                    )
-                    await asyncio.sleep(COOLDOWN_BETWEEN_RUNS_S)
-                    continue
-
-                # Пересборка baseline — СВОЯ задача, а не хвост обхода.
-                # Раньше build_baseline вызывался только в конце
-                # run_full_scan: прерванный обход означал, что новая
-                # версия не публикуется вообще, хотя данные в master_db
-                # уже лежат и пригодны. Теперь публикация зависит только
-                # от содержимого базы, а не от того, доехал ли скрейп до
-                # конца.
-                if self.due("next_build", build_interval):
-                    await self.run_task(
-                        "BUILD BASELINE", "next_build", build_interval,
-                        run_build_baseline, session,
-                    )
-                    await asyncio.sleep(COOLDOWN_BETWEEN_RUNS_S)
-                    continue
-
-                if ENABLE_FAST_TRACK and self.due("next_fast", fast_interval):
-                    await self.run_task(
-                        "FAST TRACK", "next_fast", fast_interval, run_fast_track, session,
-                        span=fast_span
-                    )
-                    await asyncio.sleep(COOLDOWN_BETWEEN_RUNS_S)
-                    continue
-
-                # Ничего не пора — спим короткими отрезками, чтобы сигнал
-                # остановки не ждал часами.
-                waits = [self.state.get("next_full", 0) - time.time(),
-                         self.state.get("next_build", 0) - time.time()]
-                if ENABLE_FAST_TRACK:
-                    waits.append(self.state.get("next_fast", 0) - time.time())
-                await asyncio.sleep(min(30.0, max(1.0, min(waits))))
+            # Независимые петли; общий сетевой gate живёт в session.
+            # При отмене/фатальном сбое ждём завершения дочерних задач,
+            # прежде чем закрывать общую сессию.
+            tasks = [
+                asyncio.create_task(self._scan_loop("FULL SCAN", "next_full", full_interval,
+                                                    run_full_scan, session, full_span)),
+                asyncio.create_task(self._build_loop(build_interval)),
+                asyncio.create_task(self._candidate_loop(candidate_interval)),
+            ]
+            if ENABLE_FAST_TRACK:
+                tasks.append(asyncio.create_task(self._scan_loop(
+                    "FAST TRACK", "next_fast", fast_interval, run_fast_track, session, fast_span)))
+            await full_scan.gather_workers(tasks)
 
         log("👋 Оркестратор остановлен.")
+
+    async def _scan_loop(self, name, key, interval, factory, session, span):
+        """Независимое расписание, но не больше одного прогона каждого типа."""
+        while not self.stopping:
+            if self.due(key, interval) and time.time() >= self.state.get("blocked_until", 0):
+                await self.run_task(name, key, interval, factory, session, span=span)
+                await asyncio.sleep(COOLDOWN_BETWEEN_RUNS_S)
+                continue
+
+            # Ничего не пора — спим короткими отрезками, чтобы сигнал
+            # остановки не ждал часами.
+            next_run = max(self.state.get(key, 0), self.state.get("blocked_until", 0))
+            await asyncio.sleep(min(30.0, max(1.0, next_run - time.time())))
+
+    async def _build_loop(self, build_interval):
+        """Пересборка baseline — СВОЯ задача, а не хвост обхода. Раньше
+        build_baseline вызывался только в конце run_full_scan: прерванный
+        обход означал, что новая версия не публикуется вообще, хотя
+        данные в master_db уже лежат и пригодны. Публикация зависит
+        только от содержимого базы, а не от того, доехал ли скрейп до
+        конца — и, с этой петлёй, не от того, идёт ли скрейп вообще
+        прямо сейчас."""
+        while not self.stopping:
+            if self.due("next_build", build_interval):
+                await self.run_task(
+                    "BUILD BASELINE", "next_build", build_interval,
+                    run_build_baseline, None,
+                )
+                await asyncio.sleep(COOLDOWN_BETWEEN_RUNS_S)
+                continue
+            await asyncio.sleep(min(30.0, max(1.0, self.state.get("next_build", 0) - time.time())))
+
+    async def _candidate_loop(self, build_interval):
+        """Independent candidate clock; the builder only reads local SQLite."""
+        while not self.stopping:
+            if self.due("next_candidate_build", build_interval):
+                await self.run_task(
+                    "BUILD CANDIDATES", "next_candidate_build", build_interval,
+                    run_build_candidates, None,
+                )
+                await asyncio.sleep(COOLDOWN_BETWEEN_RUNS_S)
+                continue
+            await asyncio.sleep(min(
+                30.0,
+                max(1.0, self.state.get("next_candidate_build", 0) - time.time()),
+            ))
 
 
 async def main():

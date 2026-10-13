@@ -9,9 +9,8 @@ Fast track — мониторинг НОВЫХ объявлений и РАНН�
     2. Сравнивает с прошлым прогоном (fast_known_ids.json):
        - id, которого раньше не было → "new";
        - id, у которого упала цена → "price_drop".
-    3. Качает карточки ТОЛЬКО для new, которых ещё нет полными в базе
-       (их мог собрать full scan). price_drop не качается: изменилась одна
-       цена, она уже есть из списка, остальные поля берутся из базы.
+    3. Качает карточки для new, которых ещё нет полными в базе, а также
+       устаревшие карточки при price_drop и отложенные обновления фотографий.
     4. Пишет в общую базу (master_db): полные карточки new, цену всех
        прочих id окна. НИКОГДА не помечает missing: окно в 5 страниц
        слишком узкое для такого вывода, это право только у full scan.
@@ -263,9 +262,13 @@ async def run(known_ids_path, output_path, max_pages, concurrency, warmup=False,
         details, bad_ids, failed_ids = {}, [], set()
         output_rows = []
         if not is_first_run:
-            referers = {i: page_url(pages[i]["page_number"]) for i in new_ids}
-            details, bad_ids = await fetch_details(session, new_ids, referers, concurrency)
-            failed_ids = set(new_ids) - details.keys()
+            with master_db.connect() as conn:
+                refresh_ids = master_db.price_drop_refresh_ids(
+                    conn, {i: row["price"] for i, row in pages.items()})
+            detail_ids = list(dict.fromkeys(new_ids + [i for i in pages if i in refresh_ids]))
+            referers = {i: page_url(pages[i]["page_number"]) for i in detail_ids}
+            details, bad_ids = await fetch_details(session, detail_ids, referers, concurrency)
+            failed_ids = set(detail_ids) - details.keys()
             for i in new_ids:
                 if i in details:
                     output_rows.append({**details[i], "reason": "new", "old_price": ""})
@@ -281,8 +284,10 @@ async def run(known_ids_path, output_path, max_pages, concurrency, warmup=False,
             # Всем прочим id окна — дешёвый патч только цены, без единого
             # detail-запроса. id, которых в базе ещё нет, патч не затронет.
             price_only = {i: row["price"] for i, row in pages.items() if i not in details}
-            price_patched = master_db.upsert_price_only(conn, price_only)
-            master_db.touch_seen(conn, [i for i, p in price_only.items() if p is None])
+            observed_at = {i: row.get("scraped_at") for i, row in pages.items()}
+            price_patched = master_db.upsert_price_only(conn, price_only, observed_at_by_id=observed_at)
+            master_db.touch_seen(conn, [i for i, p in price_only.items() if p is None],
+                                 observed_at_by_id=observed_at)
 
             if not is_first_run:
                 for i in price_drop_ids:
@@ -309,7 +314,7 @@ async def run(known_ids_path, output_path, max_pages, concurrency, warmup=False,
             print(f"⚠️  {known_ids_path} НЕ обновлён: скан неполный.")
 
         print(f"✅ {output_path} — {len(output_rows)} записей (new+price_drop)")
-        print(f"✅ база: {len(details)} новых карточек, {price_patched} id — только цена, "
+        print(f"✅ база: {len(details)} загруженных карточек, {price_patched} id — только цена, "
               f"недокачано: {len(failed_ids)}")
         return EXIT_OK
     except AbortRun as e:

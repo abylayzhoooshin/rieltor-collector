@@ -25,8 +25,8 @@ fast_known_ids.json, list_meta.json и т.д.) задавались в моду�
         деградация).
     progress_list.json       — возобновление прерванного обхода списка.
     fast_new_listings.csv,
-    krisha_astana_ids.csv,
-    krisha_astana_detail.csv — выходные артефакты, теряются молча.
+    krisha_almaty_ids.csv,
+    krisha_almaty_detail.csv — выходные артефакты, теряются молча.
 
 DATA_DIR по умолчанию "." — то есть локально поведение НЕ меняется
 (файлы там же, где были). В контейнере DATA_DIR=/app/data совпадает с
@@ -48,6 +48,11 @@ def baseline_dir():
     эфемерный /app, и API искал бы их там же.
     """
     return os.environ.get("BASELINE_DIR") or data_path("baseline_versions")
+
+
+def candidate_dir():
+    """Independent immutable pre-dedupe versions for Cleaner."""
+    return os.environ.get("CANDIDATE_DIR") or data_path("candidate_versions")
 
 
 def data_path(filename):
