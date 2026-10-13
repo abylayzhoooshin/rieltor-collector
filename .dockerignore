@@ -6,6 +6,7 @@ __pycache__/
 *.db-wal
 *.db-shm
 baseline_versions/
+candidate_versions/
 data/
 *.csv
 run.log
